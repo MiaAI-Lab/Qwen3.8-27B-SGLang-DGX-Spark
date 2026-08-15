@@ -177,7 +177,8 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 ├── stop.sh       # stop the container, clean up pid file
 ├── .env          # live config (context / concurrency / quant); not tracked by git
 ├── .env.sample   # tracked template — copy to .env to configure
-├── .gitignore    # whitelist: start.sh, stop.sh, README.md, .env.sample tracked
+├── .gitignore    # whitelist: start.sh, stop.sh, README.md, .env.sample, LICENSE, .gitignore
+├── LICENSE      # MIT
 └── README.md
 ```
 

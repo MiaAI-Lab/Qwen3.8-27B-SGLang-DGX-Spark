@@ -1,0 +1,8 @@
+# Ignore everything, except these six files
+*
+!start.sh
+!stop.sh
+!README.md
+!.env.sample
+!LICENSE
+!.gitignore
