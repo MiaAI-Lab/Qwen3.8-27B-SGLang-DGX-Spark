@@ -57,14 +57,17 @@ set -euo pipefail
 #     second checkpoint. MTP with FlashInfer needs a build newer than
 #     0.6.15.post1; if spec decode errors at boot, fall back to
 #     --attention-backend triton.
+#     SPEC_STEPS/SPEC_TOPK/SPEC_DRAFT env overrides exist for sweeping:
+#     on GB10 the draft-token count is the big tune knob (sharply
+#     peaked, acceptance-rate-dependent curve) — ./spec_sweep.sh finds
+#     this model's peak; pin the winner in .env.
 #     Alternative: DSpark (cookbook's trained drafter, separate ~2.7GB
 #     checkpoint that auto-downloads into the same HF cache):
 #       --speculative-algorithm DSPARK \
 #       --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark \
 #       --speculative-dspark-block-size 7 \
-#       --speculative-draft-model-quantization unquant \
-#     plus --max-mamba-cache-size = concurrency x 12 (see below). Block size 7
-#     (verify width 8 incl. the bonus token) and the unquantized BF16
+#       --speculative-draft-model-quantization unquant, plus block size 7
+#     (verify width 8 incl. the bonus token; window sized separately —
 #     draft are from the DSpark model card's serving recipe; leaving
 #     --speculative-dspark-block-size unset made no measurable
 #     difference here. NOTE: the draft was trained against the FP8
@@ -78,16 +81,17 @@ set -euo pipefail
 #     default 0.9 over-provisions the KV pool and silently clamps
 #     concurrency. We set --mamba-full-memory-ratio 4.21 (tuned value)
 #     and pin the pool explicitly as the authoritative override:
-#       --max-mamba-cache-size = concurrency x (S + D),
-#     with --mamba-ssm-dtype bfloat16 (state slot 78.4MB; the fp32
-#     default 153.9MB/slot would break the math).
-#     with S=4 (--mamba-radix-cache-strategy extra_buffer_lazy, state
-#     slots per request, no accuracy cost) and D=4 (MTP's
-#     speculative_num_draft_tokens) -> 8 slots/request, so the default
-#     10 requests => 80 slots (~6.3GB at 78.4MB/slot). Set
-#     MAX_CONCURRENT_REQUESTS in .env to change.
-#     DSpark instead drafts D=8 tokens/step: 12 slots/request ->
-#     --max-mamba-cache-size = concurrency x 12 (see below).
+#       --max-mamba-cache-size = concurrency x S
+#     Verified against this build's kv_cache_configurator: the engine
+#     divides the pool by S ALONE; speculative verify states (D, the
+#     draft-token window) live in a separate buffer. Earlier revisions
+#     pinned concurrency x (S+D) and over-provisioned the pool 2x.
+#     S=4 for extra_buffer_lazy + overlap scheduler (base 3 + lazy 1);
+#     S=3 with MAMBA_SKIP_DECODE_LOCK=1 (sets
+#     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK, freeing one resident slot per
+#     request). --mamba-ssm-dtype bfloat16 keeps a state slot at 78.4MB
+#     (fp32 default 153.9MB/slot would 2x the pool). DSpark's 8-token
+#     verify window is also sized separately — its pin stays x S too.
 #     --max-running-requests pins the scheduler cap to match
 #     (speculative decoding otherwise resets it to 48). After boot,
 #     check the max_running_requests line in .sglang.log.
@@ -132,12 +136,46 @@ esac
 YARN="${YARN:-0}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-10}"
+
+# Speculative decoding (MTP chain): topk=1 requires DRAFT = STEPS + 1.
+SPEC_STEPS="${SPEC_STEPS:-3}"
+SPEC_TOPK="${SPEC_TOPK:-1}"
+SPEC_DRAFT="${SPEC_DRAFT:-4}"
+CHUNKED_PREFILL="${CHUNKED_PREFILL:-8192}"
+# 1 = set SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK in the container (frees one
+# GDN state slot per running request; S 4 -> 3). 0 = stock locking.
+MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
+# Pin the container to GB10's 10 Cortex-X5 cores (5-9, 15-19; the A725
+# efficiency cores are 0-4, 10-14). Keeps scheduler/tokenizer Python off
+# the 2.8GHz little cores. Empty = no pinning.
+CPUSET="${CPUSET:-5-9,15-19}"
+# Free-form extra SGLang server flags, appended LAST so argparse's
+# last-wins rule lets them override anything above. Experiments go here:
+#   EXTRA_ARGS="--enable-fused-qk-norm-rope" ./start.sh
+#   EXTRA_ARGS="--speculative-algorithm NGRAM" ./start.sh
+# 1 = enable prefill CUDA graphs (default 0 = recipe's --disable-prefill-
+# cuda-graph; SM121 boot test before trusting).
+PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-0}"
+read -ra EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
 if (( CONTEXT_LENGTH < 262144 || CONTEXT_LENGTH > 1000000 )); then
   echo "CONTEXT_LENGTH '${CONTEXT_LENGTH}' unsupported (use 262144..1000000)"; exit 1
 fi
 case "${YARN}" in
   0|1) : ;;
   *) echo "YARN must be 0 or 1, got '${YARN}'"; exit 1 ;;
+esac
+if [[ "${SPEC_TOPK}" != "1" ]]; then
+  echo "SPEC_TOPK != 1 not wired in this recipe (MTP chain drafting)"; exit 1
+fi
+if (( SPEC_DRAFT != SPEC_STEPS + 1 )); then
+  echo "SPEC_DRAFT must equal SPEC_STEPS + 1 for topk=1 (got steps=${SPEC_STEPS}, draft=${SPEC_DRAFT})"; exit 1
+fi
+if (( CHUNKED_PREFILL < 256 )); then
+  echo "CHUNKED_PREFILL '${CHUNKED_PREFILL}' unsupported (use >= 256)"; exit 1
+fi
+case "${MAMBA_SKIP_DECODE_LOCK}" in
+  0|1) : ;;
+  *) echo "MAMBA_SKIP_DECODE_LOCK must be 0 or 1, got '${MAMBA_SKIP_DECODE_LOCK}'"; exit 1 ;;
 esac
 NEED_YARN=0
 if (( CONTEXT_LENGTH > 262144 )); then
@@ -164,9 +202,10 @@ else
 fi
 
 
-# GDN state pool: S=4 (extra_buffer_lazy) + D=4 (MTP draft tokens) = 8
-# slots per request; DSpark would be 12. Sized from MAX_CONCURRENT_REQUESTS.
-MAMBA_SLOTS_PER_REQ=8
+# GDN state pool: slots = concurrency x S; S=4 for extra_buffer_lazy +
+# overlap scheduler, 3 with MAMBA_SKIP_DECODE_LOCK=1. Speculative verify
+# states are a SEPARATE buffer — the old x(S+D) pin over-provisioned 2x.
+MAMBA_SLOTS_PER_REQ=$(( 4 - MAMBA_SKIP_DECODE_LOCK ))
 MAMBA_CACHE_SIZE=$(( MAX_CONCURRENT_REQUESTS * MAMBA_SLOTS_PER_REQ ))
 
 SERVED_MODEL_NAME="qwen3.8-27b-sglang"
@@ -212,6 +251,7 @@ fi
 echo "Starting SGLang container for ${MODEL_ID} (${QUANT})"
 echo "Context: ${CONTEXT_LENGTH} tokens${YARN_SUFFIX:-}"
 echo "Max concurrent requests: ${MAX_CONCURRENT_REQUESTS} (mamba pool ${MAMBA_CACHE_SIZE} slots)"
+echo "Spec decode: MTP steps=${SPEC_STEPS} topk=${SPEC_TOPK} draft=${SPEC_DRAFT}"
 echo "Image: ${IMAGE}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
 echo "Listening on ${HOST}:${PORT}"
@@ -221,6 +261,11 @@ cat >"${LOG_FILE}" <<EOF
 [$(date -Is)] launching SGLang container
 EOF
 
+PIN_ARGS=()
+[[ -n "${CPUSET}" ]] && PIN_ARGS=(--cpuset-cpus "${CPUSET}")
+PREFILL_GRAPH_ARGS=(--disable-prefill-cuda-graph)
+[[ "${PREFILL_CUDA_GRAPH}" == "1" ]] && PREFILL_GRAPH_ARGS=()
+
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --network host \
@@ -228,8 +273,10 @@ docker run -d \
   --privileged \
   --gpus all \
   --shm-size 32g \
+  "${PIN_ARGS[@]}" \
   -e HF_HOME=/root/.cache/huggingface \
   -e TRITON_CACHE_DIR=/root/.triton \
+  -e SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK}" \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   "${ALLOW_LONGER_ARGS[@]}" \
   -v "${HF_HOME}:/root/.cache/huggingface" \
@@ -241,8 +288,8 @@ docker run -d \
   --trust-remote-code \
   --mem-fraction-static 0.95 \
   --attention-backend flashinfer \
-  --chunked-prefill-size 8192 \
-  --disable-prefill-cuda-graph \
+  --chunked-prefill-size "${CHUNKED_PREFILL}" \
+  "${PREFILL_GRAPH_ARGS[@]}" \
   --kv-cache-dtype fp8_e4m3 \
   --mamba-ssm-dtype bfloat16 \
   --mamba-full-memory-ratio 4.21 \
@@ -251,14 +298,15 @@ docker run -d \
   --max-running-requests "${MAX_CONCURRENT_REQUESTS}" \
   "${CONTEXT_ARGS[@]}" \
   --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
+  --speculative-num-steps "${SPEC_STEPS}" \
+  --speculative-eagle-topk "${SPEC_TOPK}" \
+  --speculative-num-draft-tokens "${SPEC_DRAFT}" \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --sampling-defaults model \
   --host "${HOST}" \
   --port "${PORT}" \
+  "${EXTRA_ARGS_ARR[@]}" \
   >/dev/null
 
 container_id="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}")"

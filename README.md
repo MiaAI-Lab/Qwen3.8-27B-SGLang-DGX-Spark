@@ -4,15 +4,16 @@
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
 [![arch](https://img.shields.io/badge/arch-arm64%20%2F%20GB10-lightgrey)](#)
 
-Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). One script starts an OpenAI-compatible server, one stops it.
+Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). One script starts an OpenAI-compatible server, one stops it — with every tuning choice measured on-device instead of guessed.
 
 The serving recipe is the **[SGLang cookbook's DGX Spark cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** — the model-specific, validated launch configuration — with the speed and long-context options from the same page turned on.
 
 - **NVFP4 W4A4** checkpoint (default; BF16 and FP8 available via `QUANT=…`)
 - **native 262K context, YaRN off, and 10 concurrent requests by default** — optionally extend to a validated 1M via YaRN (see “[Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent)”)
 - **FP8 KV cache** (`fp8_e4m3`, ~2× KV memory savings; uses the NVFP4 checkpoint's calibration scales)
-- **MTP speculative decoding** (the checkpoint's own head; EAGLE 3 steps / topk 1 / 4 draft tokens) — the fastest option measured on this box; DSpark available as an alternative (see serving notes)
-- **GDN state pool** sized automatically from `MAX_CONCURRENT_REQUESTS` so concurrency isn't silently clamped
+- **MTP speculative decoding** (the checkpoint's own head; EAGLE 3 steps / topk 1 / 4 draft tokens) — the fastest option measured on this box, and **proven the peak by an on-device sweep** (steps 2–6: 12.8 → **17.2** → 16.8 → 16.3 → 15.8 tok/s; the MTP head is trained for exactly 3 steps). DSpark available as an alternative (see serving notes)
+- **GDN state pool** sized correctly from `MAX_CONCURRENT_REQUESTS` (concurrency × 4 state slots; the spec verify window is a **separate** engine-side buffer — verified in the build's `kv_cache_configurator`)
+- **Pinned to GB10's ten 3.9 GHz Cortex-X5 cores** (`--cpuset-cpus 5-9,15-19`) — the scheduler/tokenizer never land on the 2.8 GHz A725 efficiency cores (measured +2–7% decode)
 - **Thinking mode on by default** (`--reasoning-parser qwen3` → `reasoning_content`) and **tool calling** (`qwen3_coder` parser)
 
 ---
@@ -66,7 +67,13 @@ Defaults live at the top of `start.sh`:
 |---|---|---|
 | `YARN` | `0` | `0` off / `1` on for `CONTEXT_LENGTH` > 262144; implicitly on at exactly `1000000`. Factor = round(`CONTEXT_LENGTH`/262144) |
 | `CONTEXT_LENGTH` | `262144` | Range `262144`..`1000000` (native..1M). Combined with `YARN=1` for values above native; `1M` auto-enables YaRN even with `YARN=0`. Invalid values abort at startup |
-| `MAX_CONCURRENT_REQUESTS` | `10` | Sizes `--max-mamba-cache-size` = concurrency x 8 slots and passes `--max-running-requests` |
+| `MAX_CONCURRENT_REQUESTS` | `10` | Sizes `--max-mamba-cache-size` = concurrency × 4 slots and passes `--max-running-requests` |
+| `SPEC_STEPS` / `SPEC_TOPK` / `SPEC_DRAFT` | `3` / `1` / `4` | MTP chain drafting; topk=1 requires `SPEC_DRAFT = SPEC_STEPS + 1` (validated at launch). Sweep the pair on your box and pin the winner — 3/1/4 is the measured peak here |
+| `CHUNKED_PREFILL` | `8192` | Prefill chunk tokens. `2048` = smoother decode inter-token latency under mixed load (cookbook general advice; the Spark cell is validated at 8192) |
+| `CPUSET` | `5-9,15-19` | Docker `--cpuset-cpus` pin to GB10's Cortex-X5 cores (A725s are 0-4, 10-14). Empty = no pinning |
+| `MAMBA_SKIP_DECODE_LOCK` | `0` | `1` sets `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` in the container — frees one GDN state slot per request (S 4→3) |
+| `PREFILL_CUDA_GRAPH` | `0` | `1` drops `--disable-prefill-cuda-graph`. Info: this build auto-disables prefill graphs on this model anyway (GDN layers ≠ standard GQA) |
+| `EXTRA_ARGS` | — | Free-form extra SGLang flags, appended **last** (argparse last-wins, so they can override built-ins). The experiment hatch: `EXTRA_ARGS="--fp4-gemm-runner-backend triton" ./start.sh` |
 | `QUANT` | `nvfp4` | `nvfp4` → `RadixArk/Qwen3.8-27B-NVFP4`, `fp8` → `Qwen/Qwen3.8-27B-FP8`, `bf16` → `Qwen/Qwen3.8-27B`. All three fit in the Spark's 128 GB. |
 | (shell overrides) | — | Any variable above can also be set as a shell env var, or put in `.env` |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b-sglang` | Name clients use in API requests |
@@ -84,7 +91,7 @@ All long-context and concurrency handling is driven by **three variables** in `.
 |---|---|
 | `YARN` | `1` = enable YaRN rope scaling — **required** for any `CONTEXT_LENGTH` > 262144; `0` = off (sensible only at/below 262144) |
 | `CONTEXT_LENGTH` | desired context in tokens, range `262144`..`1000000` |
-| `MAX_CONCURRENT_REQUESTS` | parallel requests; also sets `--max-running-requests`, and sizes the GDN pool = value × 8 slots |
+| `MAX_CONCURRENT_REQUESTS` | parallel requests; also sets `--max-running-requests`, and sizes the GDN pool = value × 4 slots |
 
 **Step by step — 1M context with 10 concurrent (goes above the shipped default):**
 
@@ -97,7 +104,7 @@ nano .env                                # make sure these are set:
 ./stop.sh && ./start.sh                  # relaunch so new values apply
 # verify after boot:
 grep -E "context_len|max_running_requests" .sglang.log
-expect: context_len=1000000, max_running_requests=10, mamba pool 80 slots
+expect: context_len=1000000, max_running_requests=10, mamba pool 40 slots
 ```
 
 | You want | `YARN` | `CONTEXT_LENGTH` | `MAX_CONCURRENT_REQUESTS` | YaRN factor |
@@ -119,11 +126,26 @@ Rules of thumb:
 ### Notable serving choices
 
 - **Recipe (cookbook, DGX Spark cell):** `--mem-fraction-static 0.95`, `--attention-backend flashinfer` (`trtllm_mha` is SM100-only), `--chunked-prefill-size 8192`, `--disable-prefill-cuda-graph`. The Spark's unified memory fits all three checkpoints, and its cells keep the large prefill chunks (the cookbook's general 2048-token advice does not apply here).
-- **Speculative decoding (default: MTP):** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` — the checkpoint's own MTP head; no second download. Alternative: DSpark (`--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant`, separate ~2.7 GB checkpoint, fetched automatically; also bump `--max-mamba-cache-size` to concurrency × 12 slots — see the state-pool bullet). Measured head-to-head on this box (single stream, 400 tok, `./bench.sh`): MTP **16.9 / 21.0 tok/s** (thinking / non-thinking), DSpark 16.9 / 16.2, DSpark + FP8 target 11.4 / 11.5. MTP wins via far higher per-token acceptance (0.23–0.52 vs DSpark's 0.09–0.26) and a cheaper 4-token verify. The DSpark draft was trained against the FP8 target, but `QUANT=fp8` did not lift acceptance here while costing ~30% decode speed — stay on NVFP4. If either spec-decode path errors at boot, rerun with `--attention-backend triton`.
-- **GDN state pool (throughput):** hybrid GDN models reserve a state pool that sets the concurrency ceiling; the default `--mamba-full-memory-ratio 0.9` over-provisions KV and silently clamps concurrency. Pinned instead (sized from `.env`'s `MAX_CONCURRENT_REQUESTS`, default 10): `--mamba-radix-cache-strategy extra_buffer_lazy` (S=4 slots/request, no accuracy cost) + `--max-mamba-cache-size` = concurrency × 8 (MTP's S=4 + D=4) → default 80 slots (~6.3 GB pool). `--max-running-requests` pins the scheduler cap to match (spec decode otherwise resets it to 48). After boot, check the `max_running_requests` line in `.sglang.log`.
+- **Speculative decoding (default: MTP):** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` — the checkpoint's own MTP head; no second download. Alternative: DSpark (`--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant`, separate ~2.7 GB checkpoint, fetched automatically). Measured head-to-head on this box (single stream, 400 tok, pre-optimization numbers): MTP **16.9 / 21.0 tok/s** (thinking / non-thinking), DSpark 16.9 / 16.2, DSpark + FP8 target 11.4 / 11.5. MTP wins via far higher per-token acceptance (0.23–0.52 vs DSpark's 0.09–0.26) and a cheaper 4-token verify. The DSpark draft was trained against the FP8 target, but `QUANT=fp8` did not lift acceptance here while costing ~30% decode speed — stay on NVFP4. If either spec-decode path errors at boot, rerun with `--attention-backend triton`.
+  **The 3/1/4 default is measured-optimal on this silicon** (thinking tok/s, on-device sweep): steps 2 → 12.8, **3 → 17.2**, 4 → 16.8, 5 → 16.3, 6 → 15.8 — the MTP head is trained for exactly 3 steps; deeper chains only add rejected verify work. Also tested and rejected: **NGRAM** drafting (12.7–15.7 tok/s, ~30% under MTP even on tool-call-style output — the trie has nothing to draft from on generative prose) and **prefill CUDA graphs** (this build auto-disables them on this model: `some layers do not apply Standard GQA` — the GDN layers).
+- **CPU pinning (GB10 is big.LITTLE):** the container is pinned to the ten 3.9 GHz Cortex-X5 cores (`5-9,15-19`) via `--cpuset-cpus`; the ten 2.8 GHz Cortex-A725 cores (`0-4,10-14`) stay free for everything else on the host. Without pinning, the scheduler/tokenizer Python processes float across all 20 cores and land on little cores ~half the time. Measured +2–7% decode. Override with `CPUSET` (empty string = off).
+- **GDN state pool (throughput):** hybrid GDN models reserve a state pool that sets the concurrency ceiling; the default `--mamba-full-memory-ratio 0.9` over-provisions KV and silently clamps concurrency. Pinned instead: `--max-mamba-cache-size` = **concurrency × S**, where S=4 for `--mamba-radix-cache-strategy extra_buffer_lazy` + the overlap scheduler (no accuracy cost). This is the engine's own formula — verified in this build's `kv_cache_configurator.py`: the pool is divided by S alone and the speculative verify window is sized as a **separate** buffer, so folding draft tokens into the pin (early revisions here did: `× 8`) over-provisions the pool 2×. Default 10 requests → 40 slots (~3.1 GB at `--mamba-ssm-dtype bfloat16`'s 78.4 MB/slot; fp32 would be 153.9 MB). `--max-running-requests` pins the scheduler cap to match (spec decode otherwise resets it to 48). After boot, check the `max_running_requests` line in `.sglang.log`. `MAMBA_SKIP_DECODE_LOCK=1` drops S to 3 if you need the headroom.
 - **Context: native 262,144 tokens, up to a validated 1M with YaRN.** In `.env` (or as exports): `YARN=0|1` and `CONTEXT_LENGTH` (range 262144..1000000). YaRN rope scaling is applied when `CONTEXT_LENGTH` > 262144 and either `YARN=1` or the length is exactly `1000000` (so 1M works out of the box); the factor is derived as round(`CONTEXT_LENGTH`/262144) — 524288 → 2.0, 1000000 → 4.0, the model card's validated values. `start.sh` then passes `--json-model-override-args` (the `rope_parameters` block under `text_config`) + `--context-length` + `-e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`, which this SGLang build requires — without it, it logs "User-specified context_length (...) is greater than the derived context_length" and stays at 262K. Verify after boot: `grep context_len .sglang.log`. The override is **not compatible with DSpark** on this build (the draft `ModelConfig` inherits it, injecting a `text_config` dict into the draft's flat config and crashing transformers' rope validator with `AttributeError: ... 'max_position_embeddings'`), so keep `YARN=0`/`CONTEXT_LENGTH=262144` for DSpark; YaRN sits on top of the default MTP setup.
-- **KV cache:** explicit `--kv-cache-dtype fp8_e4m3`. The NVFP4 checkpoint declares FP8 KV anyway (`auto` would honor it with its calibration scales); the explicit flag keeps FP8 KV if you switch to `QUANT=bf16|fp8`. At ~32.8 KB/token, a full 1M-token sequence costs ~33 GB of KV. Measured on this box (pool = 2.3M tokens ≈ 75 GB): **two** full-length 1M requests fit simultaneously and a third is admitted as KV frees.
+- **KV cache:** explicit `--kv-cache-dtype fp8_e4m3`. The NVFP4 checkpoint declares FP8 KV anyway (`auto` would honor it with its calibration scales); the explicit flag keeps FP8 KV if you switch to `QUANT=bf16|fp8`. At ~32.8 KB/token, a full 1M-token sequence costs ~33 GB of KV. Measured on this box (pool = 2.48M tokens ≈ 81 GB): **two** full-length 1M requests fit simultaneously and a third is admitted as KV frees.
 - **Vision:** the model is a native VLM and SGLang serves the vision tower live (image + video input supported out of the box).
+
+### Measured on this box (after tuning)
+
+| Metric | Value |
+|---|---|
+| Single-stream decode, thinking mode | 17.2–20.5 tok/s |
+| Single-stream decode, non-thinking | 21.6–22.7 tok/s |
+| Tool-call request decode | 26–28 tok/s |
+| TTFT, fresh ~16K-token prompt (warm) | ~8.3 s (~1.8K tok/s prefill) |
+| TTFT, same prompt on a cold-booted server | ~13 s (first prefill pays Triton kernel warmup; the mounted cache persists it across restarts) |
+| Spec-decode sweep (steps 2/3/4/5/6) | 3/1/4 is the peak — see above |
+
+Run-to-run variance is ~±1.5 tok/s (±7%) — treat smaller deltas as noise, and re-measure twice after any restart before believing a number. The box is bandwidth-bound (~273 GB/s peak, ~240 sustained): at ~22.5 tok/s the verify passes already consume ~65% of the wall, so config-level tuning is close to exhausted. The next step-change needs a newer `lmsysorg/sglang:qwen38-27b` image — pull it, re-sweep the spec configs (~30 min of restarts and benchmarks), and re-validate.
 
 ## Thinking & tool calling
 
@@ -166,6 +188,8 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 - `start.sh` prints the last 200 log lines and exits if the container dies before becoming ready
 - Terminal output filters the harmless per-layer “Enabled fused SiLU+mul+FP4-quant…” notices; `.sglang.log` keeps everything
 - Concurrency check: `grep max_running_requests .sglang.log` — should equal your `MAX_CONCURRENT_REQUESTS` (default 10), not a lower clamped value
+- Mamba pool check: `grep max_mamba_cache_size .sglang.log` — expect `MAX_CONCURRENT_REQUESTS × 4`
+- First long prefill after a cold boot is slow (~13 s for a fresh 16K prompt vs ~8 s warm) — that's Triton kernel warmup, not a regression; the `.cache/triton` volume persists it across restarts
 - If startup dies with `AttributeError: 'PreTrainedConfig' object has no attribute 'max_position_embeddings'`, you're using DSpark with `YARN=1` / `CONTEXT_LENGTH=1000000` — the YaRN override leaks into the draft config. Keep `YARN=0` and `CONTEXT_LENGTH=262144` for DSpark (see Context note)
 - First start downloads ~22 GB of weights (plus ~2.7 GB DSpark draft model if you switch to DSpark); subsequent starts reuse `./.cache/huggingface`
 
@@ -173,12 +197,12 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 
 ```
 .
-├── start.sh      # launch SGLang container, wait for readiness
-├── stop.sh       # stop the container, clean up pid file
-├── .env          # live config (context / concurrency / quant); not tracked by git
-├── .env.sample   # tracked template — copy to .env to configure
-├── .gitignore    # whitelist: start.sh, stop.sh, README.md, .env.sample, LICENSE, .gitignore
-├── LICENSE      # MIT
+├── start.sh       # launch SGLang container, wait for readiness
+├── stop.sh        # stop the container, clean up pid file
+├── .env           # live config (context / concurrency / quant / tuning); not tracked by git
+├── .env.sample    # tracked template — copy to .env to configure
+├── .gitignore     # whitelist: start.sh, stop.sh, README.md, .env.sample, LICENSE, .gitignore
+├── LICENSE        # MIT
 └── README.md
 ```
 
