@@ -1,14 +1,17 @@
-# Ignore everything, except these nine files
+# Ignore everything, except these tracked files
 *
 !start.sh
 !start-dspark.sh
 !stop.sh
-!bench.sh
 !README.md
 !CHANGELOG.md
 !.env.sample
 !LICENSE
 !.gitignore
+!bench/
+!bench/bench.sh
+!bench/ndec.py
 # Deliberately NOT whitelisted: hybrid scripts (start-hybrid.sh,
 # start-mtp-8889.sh, hybrid-router.py) and analysis docs (DS4F/KIMI/GROK/
-# TIER_*/HANDOFF) stay untracked.
+# TIER_*). HANDOFF.md stays local — never un-ignore it.
+HANDOFF.md

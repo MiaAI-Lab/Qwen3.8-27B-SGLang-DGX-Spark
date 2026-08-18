@@ -6,12 +6,21 @@
 
 Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). Two swap-in serving modes — EAGLE/MTP or DSpark — with every tuning choice measured on-device instead of guessed.
 
-The serving recipe is the **[SGLang cookbook's DGX Spark cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** — the model-specific, validated launch configuration — with the speed and long-context options from the same page turned on.
+**DSpark is faster on code.** Versus MTP it is slower on a *long essay*. Everyday chat is a wash (same NVFP4 weights, same image, both engines 5× `ndec` + the same stream prompts):
+
+| Probe | DSpark (`./start-dspark.sh`, block-7) | MTP (`./start.sh`, EAGLE 3/1/4) |
+|---|---|---|
+| Code — LRUCache + small test (`bench/ndec.py`, n=5) | **51.5 tok/s** (51.4–51.7; `c2` always 518) | **34.5 tok/s** (34.5–34.6; `c2` always 508) |
+| Short chat — “what is a hash map…” (stream) | 22.0 / 21.3 / **23.2** (T=0 off · T=1 off · **T=1 thinking on**) | 24.6 / 23.4 / **21.0** |
+| Long essay — Babbage → GPUs (`bench/ndec.py`, n=5) | **18.3 tok/s** (18.2–18.3) | **24.1 tok/s** (24.1–24.1) |
+
+DSpark ≈ **1.5×** on LRUCache. Essay is the real MTP win (**24.1 vs 18.3**, ~1.3×). Default UI chat (thinking on) was **23.2 DSpark vs 21.0 MTP** — no felt degrade; DSpark was slightly faster. Use DSpark for agents / code / normal chat; MTP only if you write long essays. See [Which engine to use](#which-engine-to-use).
+
+The launch flags start from the **[SGLang cookbook's DGX Spark cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** (NVFP4 + DSpark), then pin choices measured on this box: GDN **bf16** (cookbook float32 was −3%), `extra_buffer_lazy`, mem **0.90**, chunk **8192**, DSpark **block 7 / 8 draft tokens**, torch.compile + decode graphs, X5 cpuset.
 
 - **NVFP4 W4A4** checkpoint (default; BF16 and FP8 available via `QUANT=…`)
 - **native 262K context, YaRN off, and 10 concurrent requests by default** — optionally extend to a validated 1M via YaRN (see “[Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent)”)
 - **FP8 KV cache** (`fp8_e4m3`, ~2× KV memory savings; uses the NVFP4 checkpoint's calibration scales)
-- **MTP speculative decoding** (the checkpoint's own head; EAGLE 3 steps / topk 1 / 4 draft tokens) on `./start.sh` — the stable, prose-friendly mode. **DSpark** (block-7, `./start-dspark.sh`) is the current default for agent/code work: measured 1.4× MTP on code (49 vs 34) at the cost of prose (18 vs 23.5). See [Which engine to use](#which-engine-to-use).
 - **GDN state pool** sized correctly from `MAX_CONCURRENT_REQUESTS` (concurrency × 4 state slots; the spec verify window is a **separate** engine-side buffer — verified in the build's `kv_cache_configurator`)
 - **Pinned to GB10's ten 3.9 GHz Cortex-X5 cores** (`--cpuset-cpus 5-9,15-19`) — the scheduler/tokenizer never land on the 2.8 GHz A725 efficiency cores (measured +2–7% decode)
 - **Thinking mode on by default** (`--reasoning-parser qwen3` → `reasoning_content`) and **tool calling** (`qwen3_coder` parser)
@@ -37,7 +46,8 @@ There is no separate download step: the container pulls the checkpoint into `./.
 cp .env.sample .env
 
 # 2. Start the server
-./start.sh
+./start-dspark.sh    # DSpark — code ~51.5; default chat ~23; long essay ~18
+# ./start.sh         # MTP — code ~34.5; default chat ~21; long essay ~24
 
 # 3. Use it
 curl http://127.0.0.1:8888/v1/models
@@ -46,34 +56,37 @@ curl http://127.0.0.1:8888/v1/models
 ./stop.sh
 ```
 
-`.env.sample` ships with `YARN=0`, `CONTEXT_LENGTH=262144` (native) and `MAX_CONCURRENT_REQUESTS=10` — so a fresh clone serves **262K context, YaRN off, 10 concurrent** after just the `cp` above. `.env` is the live config (plain `VAR=value` lines read by `start.sh`): shell exports of the same names win, `.env` fills the gaps, start.sh defaults apply last. Changes only take effect on the **next** launch — `./stop.sh && ./start.sh`. For anything above native context (e.g. 1M) or a different concurrency, see [Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent).
+`.env.sample` ships with `YARN=0`, `CONTEXT_LENGTH=262144` (native) and `MAX_CONCURRENT_REQUESTS=10` — so a fresh clone serves **262K context, YaRN off, 10 concurrent** after just the `cp` above. `.env` is the live config (plain `VAR=value` lines read by `start.sh`): shell exports of the same names win, `.env` fills the gaps, start.sh defaults apply last. Changes only take effect on the **next** launch — `./stop.sh && ./start-dspark.sh` (or `./start.sh` for MTP). For anything above native context (e.g. 1M) or a different concurrency, see [Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent). Note: DSpark cannot use YaRN / context &gt; 262144 on this build.
 
-`start.sh` is idempotent: if the container is already running it says so and exits; if a stopped container exists it removes it first. The DSpark-only mode is `./start-dspark.sh`; `./stop.sh` stops whichever engine is up.
+Both start scripts are idempotent: if the container is already running they say so and exit; if a stopped container exists they remove it first. `./stop.sh` stops whichever engine is up.
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
 | `start.sh` | Launches the SGLang container (`docker run -d`, host network, `--shm-size 32g`), streams logs to `.sglang.log`, records the container ID in `.sglang.pid`, and polls `http://127.0.0.1:8888/v1/models` until the server is ready. **EAGLE/MTP speculative decoding** (`SPEC_STEPS/SPEC_TOPK/SPEC_DRAFT = 3/1/4`). |
-| `start-dspark.sh` | Same service, **DSpark speculative decoding** instead of EAGLE: block-7 / bf16 draft, torch.compile + decode-graph caps, `--num-continuous-decode-steps 2`, mem fraction 0.90. Thin wrapper: sets the DSpark flag stack as `EXTRA_ARGS` and delegates to `start.sh`. Fast on code/tool content, slower-than-MTP on free prose. |
+| `start-dspark.sh` | Same service, **DSpark** instead of EAGLE: block-7 / unquant draft, torch.compile + decode-graph caps, `--num-continuous-decode-steps 2`, mem 0.90. Thin wrapper (`EXTRA_ARGS` → `start.sh`). **Code 51.5 vs MTP 34.5. Default chat ~23 vs ~21. Long essay 18.3 vs 24.1.** |
+| `bench/ndec.py` | Two-call net-decode A/B (LRUCache + essay, thinking off). How the DSpark vs MTP numbers above were measured. Run twice; trust the second; treat code deltas &lt;15% as noise. |
+| `bench/bench.sh` | Essay / tool-call **wall-time** bench + 16K TTFT probe (includes prefill). Different clock from `ndec.py`. |
 | `stop.sh` | Stops the serving engine (idempotent; also cleans up any experiment processes still alive). Leaves the stopped container in place for `docker logs` post-mortem. |
 
 Runtime artifacts: `.sglang.log` (server log), `.sglang.pid` (container ID), `.cache/` (HF + Triton caches). All are git-ignored.
 
-> Whitelisted for tracking: `start.sh`, `start-dspark.sh`, `stop.sh`, `bench.sh`, `README.md`, `CHANGELOG.md`, `.env.sample`, `LICENSE`, `.gitignore`. Experiment scripts and analysis docs stay untracked by design.
+> Whitelisted for tracking: `start.sh`, `start-dspark.sh`, `stop.sh`, `bench/`, `README.md`, `CHANGELOG.md`, `.env.sample`, `LICENSE`, `.gitignore`. Experiment scripts and analysis docs stay untracked by design.
 
 ## Which engine to use
 
-Same model, same image — the only difference is the speculative decoder you launch:
+Same NVFP4 27B, same `lmsysorg/sglang:qwen38-27b` image. Only the speculative decoder changes. **DSpark raises coding tok/s.** It is slower than MTP on a *long essay*. Default thinking-on chat is a wash (DSpark slightly faster in the A/B below).
 
-| | `./start.sh` (EAGLE/MTP 3/1/4) | `./start-dspark.sh` (DSpark block-7) |
+| | `./start-dspark.sh` (DSpark block-7) | `./start.sh` (EAGLE/MTP 3/1/4) |
 |---|---|---|
-| Prose / chat | **best** (~23.5 tok/s) | ~18.3 tok/s |
-| Code / tool calls / math | ~34 tok/s | **~49 tok/s** |
-| Best for | conversational, mixed, long-context | agent workloads (**current default** here) |
-| Memory | single 22 GB copy, mem 0.95 | single 22 GB copy + 2.9 GB draft, mem 0.90 |
+| Code (LRUCache, `bench/ndec.py`, n=5) | **51.5 tok/s** | **34.5 tok/s** |
+| Short chat (stream, thinking on / UI default) | **23.2 tok/s** | **21.0 tok/s** |
+| Long essay (`bench/ndec.py`, n=5) | **18.3 tok/s** | **24.1 tok/s** |
+| Best for | agents, code, tools, **normal chat** (**default here**) | long-form writing |
+| Memory | 22 GB target + ~2.7 GB draft, mem 0.90 | 22 GB target (in-checkpoint MTP), mem 0.95 |
 
-Measured head-to-head on this box (single engine, same session, net decode): DSpark wins code ≈1.4×, MTP wins prose ≈1.3×. Pick per workload — switch by stopping one and starting the other.
+Both columns are live 2026-08-18 evening (DSpark 5× `ndec` + stream; MTP boot + same suite). DSpark **+49%** on LRUCache, **−24%** on the essay, **+10%** on default chat. Switch with `./stop.sh` then the other start script. Do not compare these to sparkDash fill-to-max streams.
 
 Tuning history worth knowing: every Tier A (kernel-path) and Tier B (config/host) experiment measured **zero net gain** — these configs are the local optimum on this box. DSpark block-7 is the code peak; block-5 trades −16% code for +8% prose if you want it (`DSPARK_EXTRA`, see Configuration). Local-only write-ups: `TIER_A_RESULTS.md`, `TIER_B_RESULTS.md`, `TIER_C_RESULTS.md`, `DS4F.md`, `KIMI.md`, `GROK.md`, `HANDOFF.md`.
 
@@ -87,7 +100,7 @@ Defaults live at the top of `start.sh`:
 | `CONTEXT_LENGTH` | `262144` | Range `262144`..`1000000` (native..1M). Combined with `YARN=1` for values above native; `1M` auto-enables YaRN even with `YARN=0`. Invalid values abort at startup |
 | `MAX_CONCURRENT_REQUESTS` | `10` | Sizes `--max-mamba-cache-size` = concurrency × 4 slots and passes `--max-running-requests` |
 | `SPEC_STEPS` / `SPEC_TOPK` / `SPEC_DRAFT` | `3` / `1` / `4` | MTP chain drafting; topk=1 requires `SPEC_DRAFT = SPEC_STEPS + 1` (validated at launch). Sweep the pair on your box and pin the winner — 3/1/4 is the measured peak here |
-| `CHUNKED_PREFILL` | `8192` | Prefill chunk tokens. `2048` = smoother decode inter-token latency under mixed load (cookbook general advice; the Spark cell is validated at 8192) |
+| `CHUNKED_PREFILL` | `8192` | Prefill chunk tokens. Cookbook DGX Spark cell uses `2048`; we keep `8192` (prefill/TTFT, not decode tok/s). |
 | `CPUSET` | `5-9,15-19` | Docker `--cpuset-cpus` pin to GB10's Cortex-X5 cores (A725s are 0-4, 10-14). Empty = no pinning |
 | `MAMBA_SKIP_DECODE_LOCK` | `0` | `1` sets `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` in the container — frees one GDN state slot per request (S 4→3) |
 | `PREFILL_CUDA_GRAPH` | `0` | `1` drops `--disable-prefill-cuda-graph`. Info: this build auto-disables prefill graphs on this model anyway (GDN layers ≠ standard GQA) |
@@ -152,38 +165,30 @@ Rules of thumb:
 
 ### Notable serving choices
 
-- **Recipe (cookbook, DGX Spark cell):** `--mem-fraction-static 0.95`, `--attention-backend flashinfer` (`trtllm_mha` is SM100-only), `--chunked-prefill-size 8192`, `--disable-prefill-cuda-graph`. The Spark's unified memory fits all three checkpoints, and its cells keep the large prefill chunks (the cookbook's general 2048-token advice does not apply here).
-- **Speculative decoding (default: MTP):** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` — the checkpoint's own MTP head; no second download. Alternative: DSpark (`--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant`, separate ~2.7 GB checkpoint, fetched automatically). Measured head-to-head on this box (single stream, 400 tok, pre-optimization numbers): MTP **16.9 / 21.0 tok/s** (thinking / non-thinking), DSpark 16.9 / 16.2, DSpark + FP8 target 11.4 / 11.5. MTP wins via far higher per-token acceptance (0.23–0.52 vs DSpark's 0.09–0.26) and a cheaper 4-token verify. The DSpark draft was trained against the FP8 target, but `QUANT=fp8` did not lift acceptance here while costing ~30% decode speed — stay on NVFP4. If either spec-decode path errors at boot, rerun with `--attention-backend triton`.
-  **The 3/1/4 default is measured-optimal on this silicon** (thinking tok/s, on-device sweep): steps 2 → 12.8, **3 → 17.2**, 4 → 16.8, 5 → 16.3, 6 → 15.8 — the MTP head is trained for exactly 3 steps; deeper chains only add rejected verify work. Also tested and rejected: **NGRAM** drafting (12.7–15.7 tok/s, ~30% under MTP even on tool-call-style output — the trie has nothing to draft from on generative prose) and **prefill CUDA graphs** (this build auto-disables them on this model: `some layers do not apply Standard GQA` — the GDN layers).
+- **Recipe vs this repo:** the cookbook DGX Spark + NVFP4 + DSpark cell uses mem **0.85**, chunk **2048**, GDN **float32**, radix `extra_buffer`, and does not pin block-7 / compile / decode graphs. We measured those defaults (float32 **−3%**; FP8 target **~30% slower** than NVFP4). Live DSpark stack: mem **0.90**, chunk **8192**, GDN **bf16**, `extra_buffer_lazy`, block **7** / 8 draft tokens, torch.compile + `--cuda-graph-max-bs-decode 4`, `--num-continuous-decode-steps 2`, `--disable-prefill-cuda-graph`, flashinfer, FP8 KV. `start.sh` MTP still uses mem **0.95** and EAGLE 3/1/4.
+- **Speculative decoding:** MTP (`./start.sh`) is the in-checkpoint head — no second download. DSpark (`./start-dspark.sh`) fetches `RadixArk/Qwen3.8-27B-DSpark` (~2.7 GB) once. Current-era numbers are the table at the top (**51.5 vs 34.5 code, default chat 23.2 vs 21.0, essay 18.3 vs 24.1**), not the older wall-time 16–21 tok/s figures. The DSpark draft was trained on FP8; `QUANT=fp8` did not lift acceptance here. If spec decode errors at boot, try `--attention-backend triton`.
+  **MTP 3/1/4 is measured-optimal** on this silicon (thinking, `bench/bench.sh`-style sweep): steps 2 → 12.8, **3 → 17.2**, 4 → 16.8, 5 → 16.3, 6 → 15.8. Also rejected: **NGRAM** (12.7–15.7, ~30% under MTP even on tool-call-style output) and **prefill CUDA graphs** (this build auto-disables them: GDN layers ≠ standard GQA).
 - **CPU pinning (GB10 is big.LITTLE):** the container is pinned to the ten 3.9 GHz Cortex-X5 cores (`5-9,15-19`) via `--cpuset-cpus`; the ten 2.8 GHz Cortex-A725 cores (`0-4,10-14`) stay free for everything else on the host. Without pinning, the scheduler/tokenizer Python processes float across all 20 cores and land on little cores ~half the time. Measured +2–7% decode. Override with `CPUSET` (empty string = off).
 - **GDN state pool (throughput):** hybrid GDN models reserve a state pool that sets the concurrency ceiling; the default `--mamba-full-memory-ratio 0.9` over-provisions KV and silently clamps concurrency. Pinned instead: `--max-mamba-cache-size` = **concurrency × S**, where S=4 for `--mamba-radix-cache-strategy extra_buffer_lazy` + the overlap scheduler (no accuracy cost). This is the engine's own formula — verified in this build's `kv_cache_configurator.py`: the pool is divided by S alone and the speculative verify window is sized as a **separate** buffer, so folding draft tokens into the pin (early revisions here did: `× 8`) over-provisions the pool 2×. Default 10 requests → 40 slots (~3.1 GB at `--mamba-ssm-dtype bfloat16`'s 78.4 MB/slot; fp32 would be 153.9 MB). `--max-running-requests` pins the scheduler cap to match (spec decode otherwise resets it to 48). After boot, check the `max_running_requests` line in `.sglang.log`. `MAMBA_SKIP_DECODE_LOCK=1` drops S to 3 if you need the headroom.
 - **Context: native 262,144 tokens, up to a validated 1M with YaRN.** In `.env` (or as exports): `YARN=0|1` and `CONTEXT_LENGTH` (range 262144..1000000). YaRN rope scaling is applied when `CONTEXT_LENGTH` > 262144 and either `YARN=1` or the length is exactly `1000000` (so 1M works out of the box); the factor is derived as round(`CONTEXT_LENGTH`/262144) — 524288 → 2.0, 1000000 → 4.0, the model card's validated values. `start.sh` then passes `--json-model-override-args` (the `rope_parameters` block under `text_config`) + `--context-length` + `-e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`, which this SGLang build requires — without it, it logs "User-specified context_length (...) is greater than the derived context_length" and stays at 262K. Verify after boot: `grep context_len .sglang.log`. The override is **not compatible with DSpark** on this build (the draft `ModelConfig` inherits it, injecting a `text_config` dict into the draft's flat config and crashing transformers' rope validator with `AttributeError: ... 'max_position_embeddings'`), so keep `YARN=0`/`CONTEXT_LENGTH=262144` for DSpark; YaRN sits on top of the default MTP setup.
 - **KV cache:** explicit `--kv-cache-dtype fp8_e4m3`. The NVFP4 checkpoint declares FP8 KV anyway (`auto` would honor it with its calibration scales); the explicit flag keeps FP8 KV if you switch to `QUANT=bf16|fp8`. At ~32.8 KB/token, a full 1M-token sequence costs ~33 GB of KV. Measured on this box (pool = 2.48M tokens ≈ 81 GB): **two** full-length 1M requests fit simultaneously and a third is admitted as KV frees.
 - **Vision:** the model is a native VLM and SGLang serves the vision tower live (image + video input supported out of the box).
 
-### Measured on this box (after tuning)
+### Measured on this box
 
-| Metric | Value |
-|---|---|
-| Single-stream decode, thinking mode | 17.2–20.5 tok/s |
-| Single-stream decode, non-thinking | 21.6–22.7 tok/s |
-| Tool-call request decode | 26–28 tok/s |
-| TTFT, fresh ~16K-token prompt (warm) | ~8.3 s (~1.8K tok/s prefill) |
-| TTFT, same prompt on a cold-booted server | ~13 s (first prefill pays Triton kernel warmup; the mounted cache persists it across restarts) |
-| Spec-decode sweep (steps 2/3/4/5/6) | 3/1/4 is the peak — see above |
+**Engine A/B (2026-08-18):**
 
-Run-to-run variance is ~±1.5 tok/s (±7%) for MTP-era numbers, and the box **drifts across sessions** (prose baseline moved 19.5 → 18 tok/s over ~an hour of sustained benching with no config change — power-cap driven). Treat code-probe deltas < ~15% as noise: DSpark's rate genuinely varies along a generation, so where a 600-token benchmark truncates changes the reading; the essay/prose probe (always hits its cap, ±1% within a boot) is the reliable discriminator. The box is bandwidth-bound (~273 GB/s peak, ~240 sustained): at ~22.5 tok/s the verify passes already consume ~65% of the wall, so config-level tuning is close to exhausted. The next step-change needs a newer `lmsysorg/sglang:qwen38-27b` image — pull it, re-sweep the spec configs (~30 min of restarts and benchmarks), and re-validate.
+| Probe | Clock | DSpark block-7 | MTP 3/1/4 |
+|---|---|---|---|
+| Code — LRUCache + OrderedDict + small test | `bench/ndec.py` two-call, T=0, thinking off, n=5 | **51.5 tok/s** (51.38–51.73; `c2` always 518) | **34.5 tok/s** (34.46–34.57; `c2` always 508) |
+| Short chat — *What is a hash map, and when would I use one instead of a list?* | stream, post-first-token | **22.0** T=0 off · **21.3** T=1 off · **23.2** T=1 think on | **24.6** T=0 off · **23.4** T=1 off · **21.0** T=1 think on |
+| Long essay — history of computing, Babbage → GPUs | `bench/ndec.py` two-call, T=0, thinking off, n=5 | **18.3 tok/s** (18.18–18.29) | **24.1 tok/s** (24.05–24.13) |
 
-### DSpark vs MTP — measured head-to-head (2026-08-18, current era)
+DSpark **increases coding speed (~1.5× on LRUCache)**. The MTP prose win is the **long essay** (24.1 vs 18.3). Default UI chat (thinking on) was **23.2 DSpark vs 21.0 MTP** — no degrade; DSpark was slightly faster. Thinking-off chat is a small MTP edge (~24 vs ~22). Block sweep: block-7 is the code peak; block-5 is **+8% prose / −16% code**. `--speculative-accept-threshold-acc <1` hurt — leave at 1.0.
 
-| Metric | DSpark (`start-dspark.sh`) | MTP (`start.sh`) |
-|---|---|---|
-| Code / tool-shaped (LRU cache, SQL, …) | **~49 tok/s** (47–50) | ~34 tok/s |
-| Prose essay | ~18.3 tok/s | **~23.5 tok/s** |
+**MTP-era wall-time** (`./bench/bench.sh`, includes prefill; not comparable to the table above): thinking 17.2–20.5 tok/s, non-thinking 21.6–22.7, tool-call 26–28. TTFT on a fresh ~16K prompt ~8.3 s warm / ~13 s first boot (Triton warmup). MTP step sweep peaked at 3/1/4 (see above).
 
-DSpark block sweep (2026-08-18): block-7 is the code peak; prose peaks at block-5 (+8% over block-7 at −16% code); block-3 loses both. `--speculative-accept-threshold-acc <1` measured negative — leave at 1.0.
-
-Methodology warning (carries into future benches): the code two-call-delta probe is content-window dependent — same config reads 44–48 just by changing the truncation cap; treat code deltas <15% as noise and use the prose essay (±1% within a boot) as the discriminator. The box also drifts ~7% across sustained bench sessions (power cap) — re-baseline within a session, don't compare across hours.
+Run-to-run variance is ~±1.5 tok/s (±7%) on those wall-time numbers. The box **drifts** (essay 19.5 → 18 tok/s over ~an hour of heavy benching — power-cap). The LRUCache two-call is window-dependent (same boot 44–51 by cap); treat code deltas **&lt;15% as noise**. The essay probe (±1% within a boot) is the A/B discriminator. Re-baseline in-session; do not compare across hours. The next step-change needs a newer `lmsysorg/sglang:qwen38-27b` image.
 
 ## Thinking & tool calling
 
@@ -223,7 +228,8 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 ## Logs & troubleshooting
 
 - Tail the server log: `tail -f .sglang.log` (or `docker logs -f qwen3.8-27b-sglang`)
-- `start.sh` prints the last 200 log lines and exits if the container dies before becoming ready
+- After a DSpark boot: `grep -oE "speculative_algorithm='[^']+'|speculative_dspark_block_size=[0-9]+|context_len=[0-9]+" .sglang.log | tail -3` — expect `DSPARK`, block `7`, `262144`
+- `start.sh` / `start-dspark.sh` print the last 200 log lines and exit if the container dies before becoming ready
 - Terminal output filters the harmless per-layer “Enabled fused SiLU+mul+FP4-quant…” notices; `.sglang.log` keeps everything
 - Concurrency check: `grep max_running_requests .sglang.log` — should equal your `MAX_CONCURRENT_REQUESTS` (default 10), not a lower clamped value
 - Mamba pool check: `grep max_mamba_cache_size .sglang.log` — expect `MAX_CONCURRENT_REQUESTS × 4`
@@ -238,10 +244,12 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 ├── start.sh         # EAGLE/MTP engine (port 8888); tracked
 ├── stop.sh          # stops whichever engine is up; tracked
 ├── start-dspark.sh  # DSpark engine (port 8888); whitelisted for versioning
-├── bench.sh         # single-stream decode bench against :8888; tracked
+├── bench/
+│   ├── bench.sh     # essay / tool-call wall-time bench + TTFT probe
+│   └── ndec.py      # two-call net-decode (LRUCache + essay); DSpark vs MTP A/B
 ├── .env             # live config (context / concurrency / quant / tuning); not tracked by git
 ├── .env.sample      # tracked template — copy to .env to configure
-├── .gitignore       # whitelist: start.sh, start-dspark.sh, stop.sh, bench.sh, README.md, CHANGELOG.md, .env.sample, LICENSE, .gitignore
+├── .gitignore       # whitelist: start scripts, bench/, README, CHANGELOG, .env.sample, LICENSE
 ├── LICENSE          # MIT
 └── README.md        # tracked
 ```

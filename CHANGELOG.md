@@ -2,9 +2,30 @@
 
 All notable changes to this project are documented here. Dates are commit dates.
 
+## 2026-08-18 — DSpark vs MTP A/B; benches under `bench/`
+
+**Performance (live, same NVFP4 weights, same `lmsysorg/sglang:qwen38-27b`, 2026-08-18 evening):**
+
+- Code — LRUCache + small test (`bench/ndec.py`, n=5, T=0, thinking off): DSpark **51.5 tok/s** (51.38–51.73; `c2` always 518) vs MTP **34.5 tok/s** (34.46–34.57; `c2` always 508) — **~1.5× / +49%**.
+- Default chat — “what is a hash map…” (stream, post-first-token, T=1 thinking on): DSpark **23.2** vs MTP **21.0** — wash; DSpark slightly faster. Thinking-off short chat is a small MTP edge (24.6 / 23.4 vs 22.0 / 21.3).
+- Long essay — Babbage → GPUs (`bench/ndec.py`, n=5): DSpark **18.3 tok/s** (18.18–18.29) vs MTP **24.1 tok/s** (24.05–24.13) — MTP **~1.3× / DSpark −24%**. That is the real MTP win, not everyday chat.
+- Block sweep (same day): block-7 is the code peak; block-5 is **+8% prose / −16% code**. `--speculative-accept-threshold-acc <1` hurt — leave at 1.0.
+- Older wall-time figures (`bench/bench.sh`, includes prefill) are still MTP-era: thinking 17.2–20.5, non-thinking 21.6–22.7, tool-call 26–28. Not comparable to the `ndec` / stream table.
+
+**Added:**
+
+- `bench/ndec.py` — two-call net-decode A/B (LRUCache + essay). How the current-era numbers were measured. Treat code deltas &lt;15% as noise.
+- Moved `bench.sh` → `bench/bench.sh` (essay / tool-call wall-time + 16K TTFT). Different clock from `ndec.py`.
+- `.gitignore` whitelist: `bench/`, `bench/bench.sh`, `bench/ndec.py`. Explicit `HANDOFF.md` — stays local, never un-ignore.
+
+**Docs:**
+
+- README lead, Quick start, Which engine, and Measured tables use the n=5 + stream A/B. Quick start leads with `./start-dspark.sh` (agents / code / normal chat). `./start.sh` stays MTP (long essays, YaRN / 1M).
+- DSpark cannot use YaRN / `CONTEXT_LENGTH` &gt; 262144 on this build (rope override leaks into the draft config and crashes). Native 262K only.
+
 ## 2026-08-18 — Track `bench.sh`
 
-- `.gitignore` whitelist now includes `bench.sh` (single-stream decode bench against :8888).
+- `.gitignore` whitelist now includes `bench.sh` (single-stream decode bench against :8888). Later moved under `bench/`.
 
 ## 2026-08-18 — Tuned for DGX Spark: core pinning, correct GDN pool sizing, measured spec decoding
 
