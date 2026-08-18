@@ -157,6 +157,15 @@ CPUSET="${CPUSET:-5-9,15-19}"
 # cuda-graph; SM121 boot test before trusting).
 PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-0}"
 read -ra EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
+# Extra container env (NAME=value pairs). Used for DSpark compact/SPS:
+#   DOCKER_ENV='SGLANG_RAGGED_VERIFY_MODE=compact' ./start-dspark.sh
+DOCKER_ENV_ARGS=()
+if [[ -n "${DOCKER_ENV:-}" ]]; then
+  read -ra _docker_env_pairs <<< "${DOCKER_ENV}"
+  for _pair in "${_docker_env_pairs[@]}"; do
+    DOCKER_ENV_ARGS+=(-e "${_pair}")
+  done
+fi
 if (( CONTEXT_LENGTH < 262144 || CONTEXT_LENGTH > 1000000 )); then
   echo "CONTEXT_LENGTH '${CONTEXT_LENGTH}' unsupported (use 262144..1000000)"; exit 1
 fi
@@ -209,7 +218,10 @@ MAMBA_SLOTS_PER_REQ=$(( 4 - MAMBA_SKIP_DECODE_LOCK ))
 MAMBA_CACHE_SIZE=$(( MAX_CONCURRENT_REQUESTS * MAMBA_SLOTS_PER_REQ ))
 
 SERVED_MODEL_NAME="qwen3.8-27b-sglang"
-IMAGE="lmsysorg/sglang:qwen38-27b"
+# Image override (shell env wins): lets start-dspark.sh run a patched
+# derivative image (e.g. qwen38-tier-a:local) and roll back to stock by
+# simply not setting IMAGE. Not documented in README/CHANGELOG on purpose.
+IMAGE="${IMAGE:-lmsysorg/sglang:qwen38-27b}"
 CONTAINER_NAME="qwen3.8-27b-sglang"
 HOST="0.0.0.0"
 PORT="8888"
@@ -278,6 +290,7 @@ docker run -d \
   -e TRITON_CACHE_DIR=/root/.triton \
   -e SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK}" \
   -e HF_TOKEN="${HF_TOKEN:-}" \
+  "${DOCKER_ENV_ARGS[@]}" \
   "${ALLOW_LONGER_ARGS[@]}" \
   -v "${HF_HOME}:/root/.cache/huggingface" \
   -v "${TRITON_CACHE_DIR}:/root/.triton" \

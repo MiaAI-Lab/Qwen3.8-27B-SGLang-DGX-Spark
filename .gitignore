@@ -1,9 +1,14 @@
-# Ignore everything, except these seven files
+# Ignore everything, except these nine files
 *
 !start.sh
+!start-dspark.sh
 !stop.sh
+!bench.sh
 !README.md
 !CHANGELOG.md
 !.env.sample
 !LICENSE
 !.gitignore
+# Deliberately NOT whitelisted: hybrid scripts (start-hybrid.sh,
+# start-mtp-8889.sh, hybrid-router.py) and analysis docs (DS4F/KIMI/GROK/
+# TIER_*/HANDOFF) stay untracked.

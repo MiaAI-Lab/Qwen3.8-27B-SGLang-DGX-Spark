@@ -4,14 +4,14 @@
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
 [![arch](https://img.shields.io/badge/arch-arm64%20%2F%20GB10-lightgrey)](#)
 
-Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). One script starts an OpenAI-compatible server, one stops it — with every tuning choice measured on-device instead of guessed.
+Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). Two swap-in serving modes — EAGLE/MTP or DSpark — with every tuning choice measured on-device instead of guessed.
 
 The serving recipe is the **[SGLang cookbook's DGX Spark cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** — the model-specific, validated launch configuration — with the speed and long-context options from the same page turned on.
 
 - **NVFP4 W4A4** checkpoint (default; BF16 and FP8 available via `QUANT=…`)
 - **native 262K context, YaRN off, and 10 concurrent requests by default** — optionally extend to a validated 1M via YaRN (see “[Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent)”)
 - **FP8 KV cache** (`fp8_e4m3`, ~2× KV memory savings; uses the NVFP4 checkpoint's calibration scales)
-- **MTP speculative decoding** (the checkpoint's own head; EAGLE 3 steps / topk 1 / 4 draft tokens) — the fastest option measured on this box, and **proven the peak by an on-device sweep** (steps 2–6: 12.8 → **17.2** → 16.8 → 16.3 → 15.8 tok/s; the MTP head is trained for exactly 3 steps). DSpark available as an alternative (see serving notes)
+- **MTP speculative decoding** (the checkpoint's own head; EAGLE 3 steps / topk 1 / 4 draft tokens) on `./start.sh` — the stable, prose-friendly mode. **DSpark** (block-7, `./start-dspark.sh`) is the current default for agent/code work: measured 1.4× MTP on code (49 vs 34) at the cost of prose (18 vs 23.5). See [Which engine to use](#which-engine-to-use).
 - **GDN state pool** sized correctly from `MAX_CONCURRENT_REQUESTS` (concurrency × 4 state slots; the spec verify window is a **separate** engine-side buffer — verified in the build's `kv_cache_configurator`)
 - **Pinned to GB10's ten 3.9 GHz Cortex-X5 cores** (`--cpuset-cpus 5-9,15-19`) — the scheduler/tokenizer never land on the 2.8 GHz A725 efficiency cores (measured +2–7% decode)
 - **Thinking mode on by default** (`--reasoning-parser qwen3` → `reasoning_content`) and **tool calling** (`qwen3_coder` parser)
@@ -48,16 +48,34 @@ curl http://127.0.0.1:8888/v1/models
 
 `.env.sample` ships with `YARN=0`, `CONTEXT_LENGTH=262144` (native) and `MAX_CONCURRENT_REQUESTS=10` — so a fresh clone serves **262K context, YaRN off, 10 concurrent** after just the `cp` above. `.env` is the live config (plain `VAR=value` lines read by `start.sh`): shell exports of the same names win, `.env` fills the gaps, start.sh defaults apply last. Changes only take effect on the **next** launch — `./stop.sh && ./start.sh`. For anything above native context (e.g. 1M) or a different concurrency, see [Long context & concurrency](#long-context--concurrency-up-to-1m-10-concurrent).
 
-`start.sh` is idempotent: if the container is already running it says so and exits; if a stopped container exists it removes it first.
+`start.sh` is idempotent: if the container is already running it says so and exits; if a stopped container exists it removes it first. The DSpark-only mode is `./start-dspark.sh`; `./stop.sh` stops whichever engine is up.
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `start.sh` | Launches the SGLang container (`docker run -d`, host network, `--shm-size 32g`), streams logs to `.sglang.log`, records the container ID in `.sglang.pid`, and polls `http://127.0.0.1:8888/v1/models` until the server is ready. |
-| `stop.sh` | Stops the container, removes `.sglang.pid`, and leaves the stopped container in place for `docker logs` post-mortem (the next `start.sh` removes it). |
+| `start.sh` | Launches the SGLang container (`docker run -d`, host network, `--shm-size 32g`), streams logs to `.sglang.log`, records the container ID in `.sglang.pid`, and polls `http://127.0.0.1:8888/v1/models` until the server is ready. **EAGLE/MTP speculative decoding** (`SPEC_STEPS/SPEC_TOPK/SPEC_DRAFT = 3/1/4`). |
+| `start-dspark.sh` | Same service, **DSpark speculative decoding** instead of EAGLE: block-7 / bf16 draft, torch.compile + decode-graph caps, `--num-continuous-decode-steps 2`, mem fraction 0.90. Thin wrapper: sets the DSpark flag stack as `EXTRA_ARGS` and delegates to `start.sh`. Fast on code/tool content, slower-than-MTP on free prose. |
+| `stop.sh` | Stops the serving engine (idempotent; also cleans up any experiment processes still alive). Leaves the stopped container in place for `docker logs` post-mortem. |
 
 Runtime artifacts: `.sglang.log` (server log), `.sglang.pid` (container ID), `.cache/` (HF + Triton caches). All are git-ignored.
+
+> Whitelisted for tracking: `start.sh`, `start-dspark.sh`, `stop.sh`, `bench.sh`, `README.md`, `CHANGELOG.md`, `.env.sample`, `LICENSE`, `.gitignore`. Experiment scripts and analysis docs stay untracked by design.
+
+## Which engine to use
+
+Same model, same image — the only difference is the speculative decoder you launch:
+
+| | `./start.sh` (EAGLE/MTP 3/1/4) | `./start-dspark.sh` (DSpark block-7) |
+|---|---|---|
+| Prose / chat | **best** (~23.5 tok/s) | ~18.3 tok/s |
+| Code / tool calls / math | ~34 tok/s | **~49 tok/s** |
+| Best for | conversational, mixed, long-context | agent workloads (**current default** here) |
+| Memory | single 22 GB copy, mem 0.95 | single 22 GB copy + 2.9 GB draft, mem 0.90 |
+
+Measured head-to-head on this box (single engine, same session, net decode): DSpark wins code ≈1.4×, MTP wins prose ≈1.3×. Pick per workload — switch by stopping one and starting the other.
+
+Tuning history worth knowing: every Tier A (kernel-path) and Tier B (config/host) experiment measured **zero net gain** — these configs are the local optimum on this box. DSpark block-7 is the code peak; block-5 trades −16% code for +8% prose if you want it (`DSPARK_EXTRA`, see Configuration). Local-only write-ups: `TIER_A_RESULTS.md`, `TIER_B_RESULTS.md`, `TIER_C_RESULTS.md`, `DS4F.md`, `KIMI.md`, `GROK.md`, `HANDOFF.md`.
 
 ## Configuration
 
@@ -82,6 +100,15 @@ Defaults live at the top of `start.sh`:
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
 
 > The shipped `.env`/`.env.sample` match the `start.sh` defaults above, so a fresh clone serves **native 262K context, YaRN off, 10 concurrent** out of the box. Raise context above 262K with `YARN=1` + `CONTEXT_LENGTH` (see below).
+
+`start-dspark.sh` adds a couple of knobs (shell-env or `.env`, optional):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DSPARK_EXTRA` | — | Extra SGLang flags appended AFTER the base DSpark stack, for per-boot experiments without editing the script. E.g. `DSPARK_EXTRA="--speculative-dspark-block-size 5 --speculative-num-draft-tokens 6" ./start-dspark.sh` (prose-tuned block; see below) |
+| `IMAGE` | `lmsysorg/sglang:qwen38-27b` | env override (`IMAGE=tag ./start-dspark.sh`) to run a patched derivative image; roll back by not setting it. |
+
+Note: `--cuda-graph-max-bs` is a deprecated alias in this build; the DSpark stack uses `--cuda-graph-max-bs-decode 4`.
 
 ### Long context & concurrency (up to 1M, 10 concurrent)
 
@@ -145,7 +172,18 @@ Rules of thumb:
 | TTFT, same prompt on a cold-booted server | ~13 s (first prefill pays Triton kernel warmup; the mounted cache persists it across restarts) |
 | Spec-decode sweep (steps 2/3/4/5/6) | 3/1/4 is the peak — see above |
 
-Run-to-run variance is ~±1.5 tok/s (±7%) — treat smaller deltas as noise, and re-measure twice after any restart before believing a number. The box is bandwidth-bound (~273 GB/s peak, ~240 sustained): at ~22.5 tok/s the verify passes already consume ~65% of the wall, so config-level tuning is close to exhausted. The next step-change needs a newer `lmsysorg/sglang:qwen38-27b` image — pull it, re-sweep the spec configs (~30 min of restarts and benchmarks), and re-validate.
+Run-to-run variance is ~±1.5 tok/s (±7%) for MTP-era numbers, and the box **drifts across sessions** (prose baseline moved 19.5 → 18 tok/s over ~an hour of sustained benching with no config change — power-cap driven). Treat code-probe deltas < ~15% as noise: DSpark's rate genuinely varies along a generation, so where a 600-token benchmark truncates changes the reading; the essay/prose probe (always hits its cap, ±1% within a boot) is the reliable discriminator. The box is bandwidth-bound (~273 GB/s peak, ~240 sustained): at ~22.5 tok/s the verify passes already consume ~65% of the wall, so config-level tuning is close to exhausted. The next step-change needs a newer `lmsysorg/sglang:qwen38-27b` image — pull it, re-sweep the spec configs (~30 min of restarts and benchmarks), and re-validate.
+
+### DSpark vs MTP — measured head-to-head (2026-08-18, current era)
+
+| Metric | DSpark (`start-dspark.sh`) | MTP (`start.sh`) |
+|---|---|---|
+| Code / tool-shaped (LRU cache, SQL, …) | **~49 tok/s** (47–50) | ~34 tok/s |
+| Prose essay | ~18.3 tok/s | **~23.5 tok/s** |
+
+DSpark block sweep (2026-08-18): block-7 is the code peak; prose peaks at block-5 (+8% over block-7 at −16% code); block-3 loses both. `--speculative-accept-threshold-acc <1` measured negative — leave at 1.0.
+
+Methodology warning (carries into future benches): the code two-call-delta probe is content-window dependent — same config reads 44–48 just by changing the truncation cap; treat code deltas <15% as noise and use the prose essay (±1% within a boot) as the discriminator. The box also drifts ~7% across sustained bench sessions (power cap) — re-baseline within a session, don't compare across hours.
 
 ## Thinking & tool calling
 
@@ -197,14 +235,18 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 
 ```
 .
-├── start.sh       # launch SGLang container, wait for readiness
-├── stop.sh        # stop the container, clean up pid file
-├── .env           # live config (context / concurrency / quant / tuning); not tracked by git
-├── .env.sample    # tracked template — copy to .env to configure
-├── .gitignore     # whitelist: start.sh, stop.sh, README.md, .env.sample, LICENSE, .gitignore
-├── LICENSE        # MIT
-└── README.md
+├── start.sh         # EAGLE/MTP engine (port 8888); tracked
+├── stop.sh          # stops whichever engine is up; tracked
+├── start-dspark.sh  # DSpark engine (port 8888); whitelisted for versioning
+├── bench.sh         # single-stream decode bench against :8888; tracked
+├── .env             # live config (context / concurrency / quant / tuning); not tracked by git
+├── .env.sample      # tracked template — copy to .env to configure
+├── .gitignore       # whitelist: start.sh, start-dspark.sh, stop.sh, bench.sh, README.md, CHANGELOG.md, .env.sample, LICENSE, .gitignore
+├── LICENSE          # MIT
+└── README.md        # tracked
 ```
+
+Experiment write-ups are local-only (untracked): `DS4F.md`, `KIMI.md`, `GROK.md`, `TIER_A_RESULTS.md`, `TIER_B_RESULTS.md`, `TIER_C_RESULTS.md`, `HANDOFF.md`.
 
 ## Notes
 
@@ -216,4 +258,6 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 - [SGLang cookbook — Qwen3.8-27B](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) — the DGX Spark serving recipe, MTP and GDN state-pool guidance
 - [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) — YaRN 1M-context SGLang recipe and sampling recommendations
 - [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4) — NVFP4 W4A4 checkpoint (FP8 KV calibration scales)
+- [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) — the DSpark draft model used by `start-dspark.sh`
+- [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38) — the published DSpark-on-GB10 config (same pinned image) that the DSpark flag stack builds on
 - [SGLang](https://github.com/sgl-project/sglang) — inference engine and OpenAI/Anthropic-compatible server

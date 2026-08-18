@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. Dates are commit dates.
 
+## 2026-08-18 — Track `bench.sh`
+
+- `.gitignore` whitelist now includes `bench.sh` (single-stream decode bench against :8888).
+
 ## 2026-08-18 — Tuned for DGX Spark: core pinning, correct GDN pool sizing, measured spec decoding
 
 **Performance (measured on-device):**
