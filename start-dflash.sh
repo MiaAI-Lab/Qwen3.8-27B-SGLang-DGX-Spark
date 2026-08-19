@@ -32,7 +32,7 @@ snapshot_present() {
 }
 
 if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.bashrc" ]]; then
-  HF_TOKEN="$(sed -n 's/^HF_TOKEN=["'"'"']\?\([A-Za-z0-9_-]\+\).*/\1/p' "${HOME}/.bashrc" | head -1)"
+  HF_TOKEN="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?HF_TOKEN=["'"'"']\?\([A-Za-z0-9_-]\+\).*/\2/p' "${HOME}/.bashrc" | head -1)"
 fi
 export HF_TOKEN
 
