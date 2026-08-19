@@ -4,6 +4,13 @@
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
 [![arch](https://img.shields.io/badge/arch-arm64%20%2F%20GB10-lightgrey)](#)
 
+<p align="center">
+  <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
+  <br><br>
+  <a href="https://ko-fi.com/Z8Z3SPLOD" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" alt="Buy Me a Coffee at ko-fi.com" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+</p>
+
 Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA DGX Spark (GB10, aarch64). Three swap-in serving modes — EAGLE/MTP, DSpark, or DFlash2 — with every tuning choice measured on-device instead of guessed.
 
 **DSpark and DFlash2 are faster on code.** Versus MTP, DSpark gives the essay back; DFlash2 does not. Everyday chat on the same streamed probe comes out a DFlash2 win once tokens are counted right: **31.7 / 28.9 / 66.6** vs DSpark 22.0 / 21.3 / 23.2 and MTP 24.6 / 23.4 / 21.0 (see the counting note under the table — the DFlash2 cells are counted from the server's `completion_tokens`, because on this newer image SGLang batches several tokens per SSE event and a naive chunk-count reads ~9 “tok/s”):
