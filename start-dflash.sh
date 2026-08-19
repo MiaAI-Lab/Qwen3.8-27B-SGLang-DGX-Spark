@@ -6,12 +6,11 @@ set -euo pipefail
 # last, argparse last-wins). The draft is pinned to DRAFT_MODEL@DRAFT_REVISION
 # (z-lab's DFlash2 draft; incoai/... is a mirror of the same weights).
 # CRASH RULES (NVFP4): --mem-fraction-static 0.90 (0.95 hard-rebooted the
-# GB10 once at draft-graph capture; 0.80/0.85 were the earlier defaults; the
-# dequant-once patch that caused those spikes is fixed — see the patch)
-# keep MAX_CONCURRENT_REQUESTS modest if the box is busy; NVFP4 needs the
-# quantized-head selector patch in the image or the first request dies
-# ("DFlash2 selector requires a dense ... target lm_head"); DFLASH requires
-# --mamba-radix-cache-strategy
+# GB10 once at draft-graph capture; fixed since by running the quantized head
+# in place, no dense dequant) and modest MAX_CONCURRENT_REQUESTS if the box
+# is busy; NVFP4 needs the quantized-head selector support baked into the
+# image or the first request dies ("DFlash2 selector requires a dense ...
+# target lm_head"); DFLASH requires --mamba-radix-cache-strategy
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -35,16 +34,12 @@ fi
 export HF_TOKEN
 
 IMAGE="${IMAGE:-lmsysorg/sglang:qwen38-27b-dflash2}"
-case "${IMAGE}" in *-minoverlay) build_mode=(--minimal) ;; *) build_mode=() ;; esac
-ensure_image() {
-  if docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    echo "Using ${IMAGE}"
-  else
-    echo "${IMAGE} not present locally — building DFlash2 image ..."
-    "${SCRIPT_DIR}/build-dflash2-image.sh" "${build_mode[@]}" || { echo "DFLASH2 image build failed"; exit 1; }
-  fi
-}
-ensure_image
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+  echo "ERROR: ${IMAGE} is not present locally."
+  echo "Load or build it first, then retry (or set IMAGE=... to a prebuilt tag)."
+  exit 1
+fi
+echo "Using ${IMAGE}"
 export IMAGE
 
 ensure_cached() {
