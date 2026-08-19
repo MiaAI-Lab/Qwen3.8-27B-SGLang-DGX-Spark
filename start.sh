@@ -317,6 +317,8 @@ docker run -d \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --sampling-defaults model \
+  --enable-metrics \
+  --enable-cache-report \
   --host "${HOST}" \
   --port "${PORT}" \
   "${EXTRA_ARGS_ARR[@]}" \
