@@ -11,6 +11,12 @@
 !bench/
 !bench/bench.sh
 !bench/ndec.py
+# DFlash2 path (2026-08-19): serving script, image builds, and the overlay
+!start-dflash.sh
+!build-dflash2-image.sh
+!dflash2_nvfp4_head.patch
+!overlay-dflash2/
+!overlay-dflash2/**
 # Deliberately NOT whitelisted: hybrid scripts (start-hybrid.sh,
 # start-mtp-8889.sh, hybrid-router.py) and analysis docs (DS4F/KIMI/GROK/
 # TIER_*). HANDOFF.md stays local — never un-ignore it.
