@@ -115,7 +115,12 @@ set -euo pipefail
 # Shell env vars already set win; .env fills the gaps; defaults apply last.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-  while IFS='=' read -r key value; do
+  # `|| [[ -n "${key}" ]]` so a final line without a trailing newline is not dropped.
+  while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+    # Tolerate CRLF files and surrounding whitespace, and skip indented comments —
+    # otherwise `${!key}` below would be an indirect expansion on an invalid name.
+    key="${key%$'\r'}"; value="${value%$'\r'}"
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
     [[ -z "${key}" || "${key}" == \#* ]] && continue
     if [[ -z "${!key:-}" ]]; then
       export "${key}=${value}"
@@ -247,7 +252,9 @@ mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}"
 # Pick up HF_TOKEN from ~/.bashrc (defined without `export` there) so the
 # container gets authenticated Hub access (higher rate limits, faster downloads).
 if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.bashrc" ]]; then
-  HF_TOKEN="$(sed -n 's/^HF_TOKEN=["'"'"']\?\([A-Za-z0-9_-]\+\).*/\1/p' "${HOME}/.bashrc" | head -1)"
+  # Accept `export HF_TOKEN=…` (the idiomatic form: a bare assignment in .bashrc is
+  # not exported to child processes) as well as a plain `HF_TOKEN=…`.
+  HF_TOKEN="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?HF_TOKEN=["'"'"']\?\([A-Za-z0-9_-]\+\).*/\2/p' "${HOME}/.bashrc" | head -1)"
 fi
 export HF_TOKEN
 
