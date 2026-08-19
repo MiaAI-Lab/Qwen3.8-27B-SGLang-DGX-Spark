@@ -5,6 +5,9 @@ set -euo pipefail
 # draft instead of start.sh's EAGLE/MTP, by injecting EXTRA_ARGS (appended
 # last, argparse last-wins). The draft is pinned to DRAFT_MODEL@DRAFT_REVISION
 # (z-lab's DFlash2 draft; incoai/... is a mirror of the same weights).
+# Self-contained: if the derived image is missing, it is built automatically
+# from patch/ (patch/build-dflash2-image.sh + overlay-dflash2/; needs git +
+# network on first build).
 # CRASH RULES (NVFP4): --mem-fraction-static 0.90 (0.95 hard-rebooted the
 # GB10 once at draft-graph capture; fixed since by running the quantized head
 # in place, no dense dequant) and modest MAX_CONCURRENT_REQUESTS if the box
@@ -34,12 +37,16 @@ fi
 export HF_TOKEN
 
 IMAGE="${IMAGE:-lmsysorg/sglang:qwen38-27b-dflash2}"
-if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-  echo "ERROR: ${IMAGE} is not present locally."
-  echo "Load or build it first, then retry (or set IMAGE=... to a prebuilt tag)."
-  exit 1
-fi
-echo "Using ${IMAGE}"
+case "${IMAGE}" in *-minoverlay) build_mode=(--minimal) ;; *) build_mode=() ;; esac
+ensure_image() {
+  if docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo "Using ${IMAGE}"
+  else
+    echo "${IMAGE} not present locally — building DFlash2 image ..."
+    "${SCRIPT_DIR}/patch/build-dflash2-image.sh" "${build_mode[@]}" || { echo "DFLASH2 image build failed"; exit 1; }
+  fi
+}
+ensure_image
 export IMAGE
 
 ensure_cached() {
