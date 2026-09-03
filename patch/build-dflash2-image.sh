@@ -64,6 +64,28 @@ else
   if [[ -f "${script_dir}/dflash2_nvfp4_head.patch" ]]; then
     git -C /tmp/sglang-src apply --whitespace=nowarn "${script_dir}/dflash2_nvfp4_head.patch"
   fi
+  # Fix: TokenizerManager never checked request.is_disconnected() on the
+  # actively-streaming branch of _wait_one_response(), only on idle-timeout
+  # or non-streaming requests. A client aborting mid-stream (retry after its
+  # own read timeout during a long cold prefill) left generation running
+  # server-side indefinitely ("ghost" requests, observed up to ~15k orphaned
+  # decode steps on one rid). See patch/stream_disconnect_abort.patch.
+  if [[ -f "${script_dir}/stream_disconnect_abort.patch" ]]; then
+    git -C /tmp/sglang-src apply --whitespace=nowarn "${script_dir}/stream_disconnect_abort.patch"
+  fi
+  # Fix: on client disconnect, the streaming generator is cancelled by the
+  # ASGI layer (asyncio.CancelledError) and generate_request()'s except
+  # handler calls _discard_pending_req_states(), which only pops the local
+  # rid_to_state bookkeeping -- it never told the scheduler to stop, so
+  # generation kept running server-side until EOS/max_tokens regardless of
+  # the stream_disconnect_abort.patch check above (confirmed by controlled
+  # kill-test: is_disconnected() never wins the race against Starlette's own
+  # internal disconnect listener for a StreamingResponse, so that check never
+  # fires in practice). This makes the discard path itself call
+  # abort_request(). See patch/abort_on_disconnect.patch.
+  if [[ -f "${script_dir}/abort_on_disconnect.patch" ]]; then
+    git -C /tmp/sglang-src apply --whitespace=nowarn "${script_dir}/abort_on_disconnect.patch"
+  fi
   mkdir -p "${stage}/python/sglang"
   cp -r /tmp/sglang-src/python/sglang/. "${stage}/python/sglang/"
   {

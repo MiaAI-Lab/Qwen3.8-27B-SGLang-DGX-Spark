@@ -1,0 +1,28 @@
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index f10f1b764b..04357524f0 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1818,6 +1818,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 break
+ 
+             if is_stream:
++                if (
++                    request is not None
++                    and not obj.background
++                    and await request.is_disconnected()
++                ):
++                    # Abort the request for disconnected requests (streaming, running).
++                    # Unlike the idle-timeout and non-streaming branches below, an
++                    # actively streaming request that keeps producing tokens never
++                    # times out and never reaches the non-streaming branch, so it
++                    # never got checked here before this patch. A client that
++                    # aborts mid-stream (e.g. its own read timeout firing during a
++                    # long cold prefill, then retrying) left generation running
++                    # server-side with nobody listening until EOS/max_tokens.
++                    self.abort_request(obj.rid)
++                    raise ValueError(
++                        f"Request is disconnected from the client side (type stream). Abort request {obj.rid=}"
++                    )
+                 # Record response sent time right before we send response.
+                 if not state.time_stats.response_sent_to_client_time:
+                     state.time_stats.set_response_sent_to_client_time()

@@ -1,0 +1,31 @@
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 04357524f0..a8cb7e376d 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -3439,13 +3439,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         Safe to call after a partial/failed dispatch: only entries still present
+         are removed, and the scheduler-response path looks up state with
+         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
++
++        This is also reached on client disconnect: a streaming response's
++        async generator gets cancelled (asyncio.CancelledError, a BaseException)
++        by the ASGI layer's own disconnect handling, which lands in
++        generate_request()'s `except BaseException` and calls this. Popping
++        rid_to_state here only drops local bookkeeping -- it does not stop the
++        scheduler, which keeps decoding the request server-side with nobody
++        listening until it hits EOS/max_tokens on its own (observed as
++        thousands of orphaned "state was deleted" log lines per disconnect
++        under load). Explicitly abort on the scheduler side for any rid that
++        was actually still pending, before dropping the local entry.
+         """
+         if not hasattr(obj, "is_single") or obj.is_single:
+             rids = [obj.rid]
+         else:
+             rids = obj.rid
+         for rid in rids:
+-            self.rid_to_state.pop(rid, None)
++            if self.rid_to_state.pop(rid, None) is not None:
++                self.abort_request(rid, abort_all=True)
+ 
+     def _should_dispatch_to_encoder(
+         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
