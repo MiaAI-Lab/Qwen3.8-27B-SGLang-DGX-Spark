@@ -5,14 +5,14 @@ set -euo pipefail
 # draft instead of start.sh's EAGLE/MTP, by injecting EXTRA_ARGS (appended
 # last, argparse last-wins). The draft is pinned to DRAFT_MODEL@DRAFT_REVISION
 # (z-lab's DFlash2 draft; incoai/... is a mirror of the same weights).
-# Image: the official multi-arch lmsysorg/sglang:dev-qwen38-27b-dflash2
-# (the tag the SGLang cookbook maps to DGX Spark), pinned by its index
-# digest and pulled from Docker Hub on first run — no git clone, no local
-# build. It carries DFlash2 (sglang #35371) and the quantized target
-# lm_head selector (#35496), so every DF_TARGET works, including the
-# packed-FP4 head. Override with IMAGE=<ref>; a locally present image is
-# used as-is. The self-built image machinery (patch/) was retired
-# 2026-09-05; commit 751e29e is the last one carrying it.
+# Image: an official multi-arch lmsysorg/sglang nightly from main (pinned
+# by its index digest, pulled from Docker Hub on first run — no git clone,
+# no local build). main carries DFlash2 (sglang #35371) and the quantized
+# target lm_head selector (#35496), so every DF_TARGET works, including the
+# packed-FP4 head, plus #35255 (zombie-request fix — see CHANGELOG
+# 2026-09-09). Override with IMAGE=<ref>; a locally present image is used
+# as-is. The self-built image machinery (patch/) was retired 2026-09-05;
+# commit 751e29e is the last one carrying it.
 # CRASH RULES (NVFP4): --mem-fraction-static 0.90 (0.95 hard-rebooted the
 # GB10 once at draft-graph capture, on the self-built image; the cookbook
 # pins 0.80 on GB10 because 0.85 trips DGX OS earlyoom). Default
@@ -43,14 +43,16 @@ fi
 export HF_TOKEN
 
 # Official image, pinned by the multi-arch index digest (docker resolves the
-# linux/arm64 child). Upstream build: commit 5f55db35e on branch
-# dflash2-pin-1cf2b8c-nccl, 2026-08-22. To bump: `docker buildx imagetools
-# inspect lmsysorg/sglang:dev-qwen38-27b-dflash2` prints the index digest;
+# linux/arm64 child). Upstream build: main commit 708f51e44 (2026-09-09),
+# nightly-cu134-20260909-708f51e — the first arm64 line carrying sglang
+# #35255 (zombie-request fix; dev-qwen38-27b-dflash2 predates it, and
+# v0.5.19 was tagged before it). To bump: `docker buildx imagetools
+# inspect lmsysorg/sglang:<tag>` prints the index digest;
 # update IMAGE_DIGEST, then re-validate on the box before trusting numbers.
 IMAGE_REPO="lmsysorg/sglang"
-IMAGE_TAG="dev-qwen38-27b-dflash2"
-IMAGE_DIGEST="sha256:616a3e97f45191af975896cfa644279096cb31bd408a071c2e99ca7209c3cafe"
-IMAGE_UPSTREAM_COMMIT="5f55db35e"
+IMAGE_TAG="nightly-cu134-20260909-708f51e"
+IMAGE_DIGEST="sha256:00205b89f74691f76a0ffbd6846376d9323971930a5d59bf63a65dadc7d67927"
+IMAGE_UPSTREAM_COMMIT="708f51e44"
 IMAGE="${IMAGE:-${IMAGE_REPO}@${IMAGE_DIGEST}}"
 LEGACY_IMAGE="lmsysorg/sglang:qwen38-27b-dflash2"   # the retired self-built image
 

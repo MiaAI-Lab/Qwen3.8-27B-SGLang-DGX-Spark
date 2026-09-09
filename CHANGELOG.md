@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. Dates are commit dates.
 
+## 2026-09-09 — default image bumped to a post-#35255 nightly (zombie-request fix)
+
+The previous pin (`dev-qwen38-27b-dflash2`, sglang `5f55db35e`, 2026-08-22) predates sglang [#35255](https://github.com/sgl-project/sglang/pull/35255) (merged 2026-09-04). On that build, a streaming client disconnect mid-generation leaves a zombie request: the TokenizerManager pops the state on `CancelledError`, then `abort_request()` early-returns, so the scheduler keeps decoding to `max_tokens` — holding a `--max-running-requests` slot and flooding `Received output for rid=… but the state was deleted in TokenizerManager` (upstream: [sglang#36333](https://github.com/sgl-project/sglang/issues/36333), [#36876](https://github.com/sgl-project/sglang/issues/36876)). `v0.5.19` (tagged 2026-09-03) does not contain the fix.
+
+**Observed on the GB10 (2026-09-09):** one disconnect left a zombie decoding 16.75 min (6,466 flood lines, 98k total tokens); 10+ zombie rids accumulated over the morning with 18 router-side "client hung up" events and an instantaneous throughput collapse to ~1 tok/s under 8–10 queued requests.
+
+**Changed:**
+
+- `start-dflash.sh` defaults `IMAGE` to `lmsysorg/sglang@sha256:00205b89f74691f76a0ffbd6846376d9323971930a5d59bf63a65dadc7d67927` — the index digest of `nightly-cu134-20260909-708f51e` (main `708f51e44`, 2026-09-09; contains #35255 plus everything the old pin carried: #35371, #35496, #34763, #34859). `IMAGE=` override unchanged. Re-pin to `v0.5.20` when tagged.
+- DFLASH config unchanged: `--mamba-radix-cache-strategy extra_buffer`, `--mem-fraction-static 0.90`, same draft pin.
+
+**Verified on the GB10 (2026-09-09, after the swap):** kill-client-mid-stream repro produces zero zombie flood and the request leaves the running batch within 15 s (vs 16.75 min of zombie decode + 6,466 flood lines on the old image); direct and router (cloudflared → minirouter → :8888) smoke tests pass; RAM profile unchanged (113/121 GiB).
+
 ## 2026-09-05 — DFlash2 serves from the official SGLang image; `patch/` builder removed
 
 Upstream now publishes a multi-arch image with DFlash2 and the quantized-`lm_head` selector: `lmsysorg/sglang:dev-qwen38-27b-dflash2`, the tag the [cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) maps to DGX Spark ([issue #6](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark/issues/6)). `v0.5.18` was tagged later but does not contain the DFlash2 commit (GitHub compare: diverged), so the dev tag is pinned by digest instead of waiting for a release.
