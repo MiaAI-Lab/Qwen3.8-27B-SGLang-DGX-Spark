@@ -25,9 +25,11 @@ set -euo pipefail
 #     this build (draft config inherits the rope override and crashes);
 #     keep YARN=0, CONTEXT_LENGTH=262144.
 #   - .env still applies for everything else (QUANT, concurrency,
-#     CHUNKED_PREFILL, CPUSET, ...) except EXTRA_ARGS — this script's
-#     EXTRA_ARGS wins. If you need extra flags on top, append them to the
-#     EXTRA_ARGS export below (space-separated).
+#     CHUNKED_PREFILL, CPUSET, THINKING, REASONING_EFFORT, ...) except
+#     EXTRA_ARGS — this script's EXTRA_ARGS wins. If you need extra
+#     flags on top, append them to the EXTRA_ARGS export below
+#     (space-separated). THINKING / REASONING_EFFORT are their own
+#     launch flags in start.sh, so they survive this EXTRA_ARGS wrap.
 #   - DSPARK_EXTRA env var (optional): extra flags appended AFTER the base
 #     stack, for per-boot experiments without editing this file, e.g.:
 #       DSPARK_EXTRA="--linear-attn-decode-backend flashinfer" ./start-dspark.sh

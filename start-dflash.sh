@@ -20,6 +20,8 @@ set -euo pipefail
 # DFLASH requires --mamba-radix-cache-strategy extra_buffer on the image
 # this was validated on (extra_buffer_lazy was rejected); the official
 # image adds lazy support (#34763) but that is untested here.
+# THINKING / REASONING_EFFORT from .env still apply: they are their own
+# start.sh flags, not EXTRA_ARGS, so this wrap does not wipe them.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
