@@ -40,9 +40,12 @@ set -euo pipefail
 #         clobber them). THINKING=0 → server-wide
 #         --default-chat-template-kwargs '{"enable_thinking": false}'.
 #         REASONING_EFFORT=low|medium keeps thinking on but turns the
-#         depth down from xhigh. Empty / xhigh = template default
-#         (no extra flag, so older images keep booting). Per-request
-#         chat_template_kwargs / reasoning_effort still win.
+#         depth down from xhigh (low = "keep it brief"; medium =
+#         no extra prompt, model discretion). There is no skip-on-
+#         simple / auto: thinking-on always opens <think>. Empty /
+#         xhigh = template default (no extra flag, so older images
+#         keep booting). Per-request chat_template_kwargs /
+#         reasoning_effort still win.
 #         Non-thinking sampling (when THINKING=0 or the client disables
 #         it): temperature=0.7, top_p=0.8, presence_penalty=1.5.
 #       * --sampling-defaults model (SGLang default, pinned):

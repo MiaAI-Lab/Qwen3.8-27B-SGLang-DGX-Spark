@@ -14,6 +14,8 @@ Qwen3.8's chat template defaults `enable_thinking=true` and `reasoning_effort=xh
 
 **Not changed:** the default stays thinking-on / `xhigh` (agents, code, the measured benches). Everyday chat is `THINKING=0` in `.env`, then `./stop.sh && ./start-dspark.sh` (or `./start.sh` / `./start-dflash.sh`).
 
+**Not in the model:** there is no skip-on-simple / `auto` effort. The official template always opens `<think>` when thinking is on; `low`/`medium`/`xhigh` only steer how long it stays open (`medium` injects nothing — Qwen: token use is then at the model’s discretion). True per-query adaptiveness is the client picking `enable_thinking` / `reasoning_effort` per request.
+
 ## 2026-09-09 — default image bumped to a post-#35255 nightly (zombie-request fix)
 
 The previous pin (`dev-qwen38-27b-dflash2`, sglang `5f55db35e`, 2026-08-22) predates sglang [#35255](https://github.com/sgl-project/sglang/pull/35255) (merged 2026-09-04). On that build, a streaming client disconnect mid-generation leaves a zombie request: the TokenizerManager pops the state on `CancelledError`, then `abort_request()` early-returns, so the scheduler keeps decoding to `max_tokens` — holding a `--max-running-requests` slot and flooding `Received output for rid=… but the state was deleted in TokenizerManager` (upstream: [sglang#36333](https://github.com/sgl-project/sglang/issues/36333), [#36876](https://github.com/sgl-project/sglang/issues/36876)). `v0.5.19` (tagged 2026-09-03) does not contain the fix.
