@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. Dates are commit dates.
 
+## 2026-09-12 — THINKING / REASONING_EFFORT recipe knobs (Qwen3.8 overthinking)
+
+Qwen3.8's chat template defaults `enable_thinking=true` and `reasoning_effort=xhigh`. That is why a one-line question still burns a long `<think>` block — the model is doing what the template asked, not a serving bug. The cookbook and this repo already documented the per-request disable; there was no launch-time way to change the default without stuffing JSON into `EXTRA_ARGS` (which `start-dspark.sh` / `start-dflash.sh` overwrite).
+
+**Changed:**
+
+- `start.sh` reads `THINKING` (`0`/`1`, default `1`) and `REASONING_EFFORT` (`low`/`medium`/`xhigh`/empty). `THINKING=0` passes `--default-chat-template-kwargs '{"enable_thinking": false}'`; `REASONING_EFFORT=low|medium` passes the matching kwargs. Empty / `xhigh` pass **no** extra flag, so the default path still boots on images that predate SGLang's kwargs arg ([sglang #29579](https://github.com/sgl-project/sglang/pull/29579), also what the [vLLM Qwen3.8 recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B) uses server-wide).
+- Own argv slot, before `EXTRA_ARGS`, so DSpark/DFlash wrappers do not clobber it. Per-request `chat_template_kwargs` / `reasoning_effort` still win (SGLang setdefault).
+- `.env.sample`, README (Configuration + Thinking & tool calling + Using the API), `start-dspark.sh` / `start-dflash.sh` comments.
+
+**Not changed:** the default stays thinking-on / `xhigh` (agents, code, the measured benches). Everyday chat is `THINKING=0` in `.env`, then `./stop.sh && ./start-dspark.sh` (or `./start.sh` / `./start-dflash.sh`).
+
 ## 2026-09-09 — default image bumped to a post-#35255 nightly (zombie-request fix)
 
 The previous pin (`dev-qwen38-27b-dflash2`, sglang `5f55db35e`, 2026-08-22) predates sglang [#35255](https://github.com/sgl-project/sglang/pull/35255) (merged 2026-09-04). On that build, a streaming client disconnect mid-generation leaves a zombie request: the TokenizerManager pops the state on `CancelledError`, then `abort_request()` early-returns, so the scheduler keeps decoding to `max_tokens` — holding a `--max-running-requests` slot and flooding `Received output for rid=… but the state was deleted in TokenizerManager` (upstream: [sglang#36333](https://github.com/sgl-project/sglang/issues/36333), [#36876](https://github.com/sgl-project/sglang/issues/36876)). `v0.5.19` (tagged 2026-09-03) does not contain the fix.

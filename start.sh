@@ -27,16 +27,24 @@ set -euo pipefail
 #     flag also forces fp8 KV when QUANT=bf16|fp8 (dynamic scales).
 #     ~32.8 KB/token -> a 1M-token sequence needs ~33GB of KV.
 #   - Thinking & tool calling (model card + cookbook section 3):
-#       * Thinking mode is ON by default: the chat template defaults
-#         enable_thinking=true and preserve_thinking=true (full
-#         reasoning trace retained across turns; good for agents and
-#         KV cache reuse). --reasoning-parser qwen3 surfaces the
-#         <think> block as reasoning_content instead of inline text.
-#         Disable per request via chat_template_kwargs
-#         {"enable_thinking": false} (then prefer temperature=0.7,
-#         top_p=0.8, presence_penalty=1.5 per card). Reasoning depth
-#         per request: reasoning_effort=xhigh|medium|low (xhigh
-#         default).
+#       * Thinking mode is ON by default at reasoning_effort=xhigh:
+#         the chat template defaults enable_thinking=true and
+#         preserve_thinking=true (full reasoning trace retained across
+#         turns; good for agents and KV cache reuse). That is why a
+#         one-line question still burns a long <think> block — the
+#         model is doing what the template asked, not "being stupid".
+#         --reasoning-parser qwen3 surfaces the <think> block as
+#         reasoning_content instead of inline text.
+#       * Recipe knobs (shell or .env; take effect on the next launch;
+#         live as their own flags so DSpark/DFlash EXTRA_ARGS cannot
+#         clobber them). THINKING=0 → server-wide
+#         --default-chat-template-kwargs '{"enable_thinking": false}'.
+#         REASONING_EFFORT=low|medium keeps thinking on but turns the
+#         depth down from xhigh. Empty / xhigh = template default
+#         (no extra flag, so older images keep booting). Per-request
+#         chat_template_kwargs / reasoning_effort still win.
+#         Non-thinking sampling (when THINKING=0 or the client disables
+#         it): temperature=0.7, top_p=0.8, presence_penalty=1.5.
 #       * --sampling-defaults model (SGLang default, pinned):
 #         recommended sampling params come from the checkpoint's
 #         generation_config.json; thinking mode wants temperature=1.0,
@@ -114,7 +122,8 @@ set -euo pipefail
 #     validator (AttributeError: ... 'max_position_embeddings'). If you
 #     switch to DSpark, keep YARN=0 and CONTEXT_LENGTH=262144.
 
-# Load optional .env overrides (QUANT, YARN, CONTEXT_LENGTH, MAX_CONCURRENT_REQUESTS).
+# Load optional .env overrides (QUANT, YARN, CONTEXT_LENGTH,
+# MAX_CONCURRENT_REQUESTS, THINKING, REASONING_EFFORT, …).
 # Shell env vars already set win; .env fills the gaps; defaults apply last.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
@@ -167,6 +176,15 @@ CPUSET="${CPUSET:-5-9,15-19}"
 # 1 = enable prefill CUDA graphs (default 0 = recipe's --disable-prefill-
 # cuda-graph; SM121 boot test before trusting).
 PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-0}"
+# Thinking defaults. THINKING=1 (default) leaves the chat template alone
+# (enable_thinking=true, reasoning_effort=xhigh). THINKING=0 and/or
+# REASONING_EFFORT=low|medium become --default-chat-template-kwargs so
+# every request inherits them; clients can still override per call.
+# Own argv slot (not EXTRA_ARGS) so start-dspark.sh / start-dflash.sh
+# do not wipe it. Empty / xhigh pass no flag — older images without
+# --default-chat-template-kwargs still boot.
+THINKING="${THINKING:-1}"
+REASONING_EFFORT="${REASONING_EFFORT:-}"
 read -ra EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
 # Extra container env (NAME=value pairs). Used for DSpark compact/SPS:
 #   DOCKER_ENV='SGLANG_RAGGED_VERIFY_MODE=compact' ./start-dspark.sh
@@ -197,6 +215,26 @@ case "${MAMBA_SKIP_DECODE_LOCK}" in
   0|1) : ;;
   *) echo "MAMBA_SKIP_DECODE_LOCK must be 0 or 1, got '${MAMBA_SKIP_DECODE_LOCK}'"; exit 1 ;;
 esac
+case "${THINKING}" in
+  0|1) : ;;
+  *) echo "THINKING must be 0 or 1, got '${THINKING}'"; exit 1 ;;
+esac
+case "${REASONING_EFFORT}" in
+  ""|xhigh|medium|low) : ;;
+  *) echo "REASONING_EFFORT must be empty, xhigh, medium, or low, got '${REASONING_EFFORT}'"; exit 1 ;;
+esac
+# Only emit --default-chat-template-kwargs when the operator asked for
+# something other than the template default. xhigh is a no-op.
+CHAT_TEMPLATE_KWARGS_ARGS=()
+if [[ "${THINKING}" == "0" ]]; then
+  CHAT_TEMPLATE_KWARGS_ARGS=(--default-chat-template-kwargs '{"enable_thinking": false}')
+  THINKING_LABEL="OFF (server default: enable_thinking=false)"
+elif [[ "${REASONING_EFFORT}" == "low" || "${REASONING_EFFORT}" == "medium" ]]; then
+  CHAT_TEMPLATE_KWARGS_ARGS=(--default-chat-template-kwargs "{\"reasoning_effort\": \"${REASONING_EFFORT}\"}")
+  THINKING_LABEL="ON, reasoning_effort=${REASONING_EFFORT} (server default)"
+else
+  THINKING_LABEL="ON by default (xhigh; disable per request: chat_template_kwargs {\"enable_thinking\": false})"
+fi
 NEED_YARN=0
 if (( CONTEXT_LENGTH > 262144 )); then
   if [[ "${YARN}" == "1" ]] || [[ "${CONTEXT_LENGTH}" == "1000000" ]]; then
@@ -277,6 +315,7 @@ echo "Starting SGLang container for ${MODEL_ID} (${QUANT})"
 echo "Context: ${CONTEXT_LENGTH} tokens${YARN_SUFFIX:-}"
 echo "Max concurrent requests: ${MAX_CONCURRENT_REQUESTS} (mamba pool ${MAMBA_CACHE_SIZE} slots)"
 echo "Spec decode: MTP steps=${SPEC_STEPS} topk=${SPEC_TOPK} draft=${SPEC_DRAFT}"
+echo "Thinking: ${THINKING_LABEL}"
 echo "Image: ${IMAGE}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
 echo "Listening on ${HOST}:${PORT}"
@@ -330,6 +369,7 @@ docker run -d \
   --speculative-num-draft-tokens "${SPEC_DRAFT}" \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  "${CHAT_TEMPLATE_KWARGS_ARGS[@]}" \
   --sampling-defaults model \
   --enable-metrics \
   --enable-cache-report \
@@ -378,6 +418,6 @@ echo "SGLang is ready"
 echo "OpenAI base URL: http://${HOST}:${PORT}/v1"
 echo "Anthropic-compatible: http://${HOST}:${PORT}/v1/messages (no /v1 suffix in ANTHROPIC_BASE_URL)"
 echo "Served model name: ${SERVED_MODEL_NAME}"
-echo "Thinking: ON by default (disable per request: chat_template_kwargs {\"enable_thinking\": false})"
+echo "Thinking: ${THINKING_LABEL}"
 
 echo "SGLang is ready and responding; shell is now free."
